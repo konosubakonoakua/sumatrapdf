@@ -165,7 +165,7 @@ struct HtmlFormatterArgs {
        used to allocate this text. */
     Allocator* textAllocator{nullptr};
 
-    mui::TextRenderMethod textRenderMethod = mui::TextRenderMethodGdiplus;
+    mui::TextRenderMethod textRenderMethod = mui::TextRenderMethod::Gdiplus;
 
     std::span<u8> htmlStr;
 
@@ -301,8 +301,6 @@ class HtmlFormatter {
     // number of pages generated so far, approximate. Only used
     // for detection of cover image duplicates in mobi formatting
     int pageCount{0};
-
-    WCHAR buf[512]{};
 
   public:
     explicit HtmlFormatter(HtmlFormatterArgs* args);

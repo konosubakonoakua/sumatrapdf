@@ -30,7 +30,7 @@
 #include "CrashHandler.h"
 #include "Translations.h"
 
-#include "ifilter/PdfFilter.h"
+#include "ifilter/PdfFilterClsid.h"
 #include "previewer/PdfPreview.h"
 
 #include "SumatraConfig.h"
@@ -132,13 +132,9 @@ const WCHAR* gSupportedExtsSumatra[] = {
     L".fb2", L".fb2z", L".prc",  L".tif", L".tiff", L".jp2",  L".png",
     L".jpg",  L".jpeg", L".tga", L".gif",  nullptr
 };
-const WCHAR* gSupportedExtsRaMicro[] = { L".pdf", nullptr };
 // clang-format on
 
 const WCHAR** GetSupportedExts() {
-    if (gIsRaMicroBuild) {
-        return gSupportedExtsRaMicro;
-    }
     return gSupportedExtsSumatra;
 }
 
@@ -422,7 +418,8 @@ static bool KillProcWithIdAndModule(DWORD processId, const WCHAR* modulePath, bo
 // modulePath
 // returns -1 on error, 0 if no matching processes
 int KillProcessesWithModule(const WCHAR* modulePath, bool waitUntilTerminated) {
-    logf("KillProcessesWithModule: '%s'\n", modulePath);
+    auto modulePathA = TempToUtf8(modulePath);
+    logf("KillProcessesWithModule: '%s'\n", modulePathA.Get());
     AutoCloseHandle hProcSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (INVALID_HANDLE_VALUE == hProcSnapshot) {
         return -1;

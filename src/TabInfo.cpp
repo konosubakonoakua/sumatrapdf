@@ -26,7 +26,6 @@
 #include "AppUtil.h"
 #include "Selection.h"
 #include "Translations.h"
-#include "ParseBKM.h"
 #include "EditAnnotations.h"
 
 TabInfo::TabInfo(WindowInfo* win, const WCHAR* filePath) {
@@ -39,10 +38,8 @@ TabInfo::~TabInfo() {
     if (AsChm()) {
         AsChm()->RemoveParentHwnd();
     }
-    DeleteVecMembers(altBookmarks);
     delete selectionOnPage;
     delete ctrl;
-    delete tocSorted;
     CloseAndDeleteEditAnnotationsWindow(editAnnotsWindow);
 }
 
@@ -130,7 +127,7 @@ LinkSaver::LinkSaver(TabInfo* tab, HWND parentHwnd, const WCHAR* fileName) {
 #endif
 
 bool SaveDataToFile(HWND hwndParent, WCHAR* fileName, std::span<u8> data) {
-    if (!HasPermission(Perm_DiskAccess)) {
+    if (!HasPermission(Perm::DiskAccess)) {
         return false;
     }
 

@@ -97,14 +97,14 @@ class FileExistenceChecker : public ThreadBase {
 static FileExistenceChecker* gFileExistenceChecker = nullptr;
 
 void FileExistenceChecker::GetFilePathsToCheck() {
-    DisplayState* state;
+    FileState* state;
     for (size_t i = 0; i < 2 * FILE_HISTORY_MAX_RECENT && (state = gFileHistory.Get(i)) != nullptr; i++) {
         if (!state->isMissing) {
             paths.Append(str::Dup(state->filePath));
         }
     }
     // add missing paths from the list of most frequently opened documents
-    Vec<DisplayState*> frequencyList;
+    Vec<FileState*> frequencyList;
     gFileHistory.GetFrequencyOrder(frequencyList);
     size_t iMax = std::min<size_t>(2 * FILE_HISTORY_MAX_FREQUENT, frequencyList.size());
     for (size_t i = 0; i < iMax; i++) {
@@ -350,10 +350,10 @@ static bool SetupPluginMode(Flags& i) {
     }
 
     // don't save preferences for plugin windows (and don't allow fullscreen mode)
-    // TODO: Perm_DiskAccess is required for saving viewed files and printing and
-    //       Perm_InternetAccess is required for crash reports
+    // TODO: Perm::DiskAccess is required for saving viewed files and printing and
+    //       Perm::InternetAccess is required for crash reports
     // (they can still be disabled through sumatrapdfrestrict.ini or -restrict)
-    RestrictPolicies(Perm_SavePreferences | Perm_FullscreenAccess);
+    RestrictPolicies(Perm::SavePreferences | Perm::FullscreenAccess);
 
     i.reuseDdeInstance = i.exitWhenDone = false;
     gGlobalPrefs->reuseInstance = false;
@@ -466,13 +466,10 @@ Error:
     goto Retry;
 }
 
-// TODO(port)
-// extern "C" void fz_redirect_dll_io_to_console();
-
 // Registering happens either through the Installer or the Options dialog;
 // here we just make sure that we're still registered
 static bool RegisterForPdfExtentions(HWND hwnd) {
-    if (IsRunningInPortableMode() || !HasPermission(Perm_RegistryAccess) || gPluginMode) {
+    if (IsRunningInPortableMode() || !HasPermission(Perm::RegistryAccess) || gPluginMode) {
         return false;
     }
 
@@ -484,10 +481,10 @@ static bool RegisterForPdfExtentions(HWND hwnd) {
        see this dialog */
     if (!gGlobalPrefs->associateSilently) {
         INT_PTR result = Dialog_PdfAssociate(hwnd, &gGlobalPrefs->associateSilently);
-        str::ReplacePtr(&gGlobalPrefs->associatedExtensions, IDYES == result ? L".pdf" : nullptr);
+        str::ReplaceWithCopy(&gGlobalPrefs->associatedExtensions, IDYES == result ? ".pdf" : nullptr);
     }
     // for now, .pdf is the only choice
-    if (!str::EqI(gGlobalPrefs->associatedExtensions, L".pdf")) {
+    if (!str::EqI(gGlobalPrefs->associatedExtensions, ".pdf")) {
         return false;
     }
 
@@ -518,6 +515,7 @@ static int RunMessageLoop() {
         }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
+        ResetTempAllocator();
     }
 
     return (int)msg.wParam;
@@ -532,9 +530,19 @@ static void ShutdownCommon() {
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 }
 
+// TODO: need testing
+static void ReplaceColor(char** col, WCHAR* maybeColor) {
+    ParsedColor c;
+    ParseColor(c, TempToUtf8(maybeColor).Get());
+    if (c.parsedOk) {
+        char* colNewStr = SerializeColor(c.col);
+        str::ReplacePtr(&gGlobalPrefs->mainWindowBackground, colNewStr);
+    }
+}
+
 static void UpdateGlobalPrefs(const Flags& i) {
     if (i.inverseSearchCmdLine) {
-        str::ReplacePtr(&gGlobalPrefs->inverseSearchCmdLine, i.inverseSearchCmdLine);
+        str::ReplaceWithCopy(&gGlobalPrefs->inverseSearchCmdLine, i.inverseSearchCmdLine);
         gGlobalPrefs->enableTeXEnhancements = true;
     }
     gGlobalPrefs->fixedPageUI.invertColors = i.invertColors;
@@ -545,10 +553,10 @@ static void UpdateGlobalPrefs(const Flags& i) {
         } else if (str::EqI(i.globalPrefArgs.at(n), L"-bgcolor") || str::EqI(i.globalPrefArgs.at(n), L"-bg-color")) {
             // -bgcolor is for backwards compat (was used pre-1.3)
             // -bg-color is for consistency
-            ParseColor(&gGlobalPrefs->mainWindowBackground, i.globalPrefArgs.at(++n));
+            ReplaceColor(&gGlobalPrefs->mainWindowBackground, i.globalPrefArgs.at(++n));
         } else if (str::EqI(i.globalPrefArgs.at(n), L"-set-color-range")) {
-            ParseColor(&gGlobalPrefs->fixedPageUI.textColor, i.globalPrefArgs.at(++n));
-            ParseColor(&gGlobalPrefs->fixedPageUI.backgroundColor, i.globalPrefArgs.at(++n));
+            ReplaceColor(&gGlobalPrefs->fixedPageUI.textColor, i.globalPrefArgs.at(++n));
+            ReplaceColor(&gGlobalPrefs->fixedPageUI.backgroundColor, i.globalPrefArgs.at(++n));
         } else if (str::EqI(i.globalPrefArgs.at(n), L"-fwdsearch-offset")) {
             gGlobalPrefs->forwardSearch.highlightOffset = _wtoi(i.globalPrefArgs.at(++n));
             gGlobalPrefs->enableTeXEnhancements = true;
@@ -556,7 +564,7 @@ static void UpdateGlobalPrefs(const Flags& i) {
             gGlobalPrefs->forwardSearch.highlightWidth = _wtoi(i.globalPrefArgs.at(++n));
             gGlobalPrefs->enableTeXEnhancements = true;
         } else if (str::EqI(i.globalPrefArgs.at(n), L"-fwdsearch-color")) {
-            ParseColor(&gGlobalPrefs->forwardSearch.highlightColor, i.globalPrefArgs.at(++n));
+            ReplaceColor(&gGlobalPrefs->forwardSearch.highlightColor, i.globalPrefArgs.at(++n));
             gGlobalPrefs->enableTeXEnhancements = true;
         } else if (str::EqI(i.globalPrefArgs.at(n), L"-fwdsearch-permanent")) {
             gGlobalPrefs->forwardSearch.highlightPermanent = _wtoi(i.globalPrefArgs.at(++n));
@@ -566,12 +574,6 @@ static void UpdateGlobalPrefs(const Flags& i) {
             gGlobalPrefs->comicBookUI.cbxMangaMode = str::EqI(L"true", s) || str::Eq(L"1", s);
         }
     }
-}
-
-static bool ExeHasNameOfRaMicro() {
-    AutoFreeWstr exePath = GetExePath();
-    const WCHAR* exeName = path::GetBaseNameNoFree(exePath);
-    return str::FindI(exeName, L"ramicro");
 }
 
 // we're in installer mode if the name of the executable
@@ -756,9 +758,10 @@ bool gEnableMemLeak = false;
 // call this function before MemLeakInit() so that those allocations
 // don't show up
 static void ForceStartupLeaks() {
-    time_t secs;
+    time_t secs{0};
     struct tm buf_not_used;
     gmtime_s(&buf_not_used, &secs);
+    gmtime(&secs);
     WCHAR* path = GetExePath();
     FILE* fp = _wfopen(path, L"rb");
     str::Free(path);
@@ -779,7 +782,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
 
     CrashIf(hInstance != GetInstance());
 
-    // decide if we should enable mem leak detection
+    // TODO: decide if we should enable mem leak detection
 #if defined(DEBUG)
     gEnableMemLeak = true;
 #endif
@@ -807,13 +810,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
 
     srand((unsigned int)time(nullptr));
 
+    // for testing mem leak detection
+    void* maybeLeak{nullptr};
     if (gEnableMemLeak) {
         ForceStartupLeaks();
         MemLeakInit();
+        maybeLeak = malloc(10);
     }
-
-    // for testing mem leak detection
-    // char* tmp = new char[23];
+    // maybeLeak = malloc(10);
 
     if (!gIsAsanBuild) {
         SetupCrashHandler();
@@ -841,22 +845,25 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
     // gAddCrashMeMenu = true;
 
     {
-        strconv::StackWstrToUtf8 cmdLineA = GetCommandLineW();
+        TempStr cmdLineA = TempToUtf8(GetCommandLineW());
         logf("CmdLine: %s\n", cmdLineA.Get());
     }
 
     Flags i;
     ParseCommandLine(GetCommandLineW(), i);
 
+    /*
     if (false && gIsDebugBuild) {
         int TestLice(HINSTANCE hInstance, int nCmdShow);
         retCode = TestLice(hInstance, nCmdShow);
         goto Exit;
     }
+    */
 
     // TODO: maybe add cmd-line switch to enable debug logging
-    gEnableDbgLog = gIsDebugBuild || gIsDailyBuild || gIsPreReleaseBuild;
+    gEnableDbgLog = gIsDebugBuild || gIsPreReleaseBuild;
 
+#if defined(DEBUG)
     if (gIsDebugBuild || gIsPreReleaseBuild) {
         if (i.tester) {
             extern int TesterMain(); // in Tester.cpp
@@ -867,15 +874,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
             return RegressMain();
         }
     }
-
-    if (i.ramicro) {
-        gIsRaMicroBuild = true;
-        gWithTocEditor = true;
-    }
-    if (ExeHasNameOfRaMicro()) {
-        gIsRaMicroBuild = true;
-        gWithTocEditor = true;
-    }
+#endif
 
     if (i.showHelp && IsInstallerButNotInstalled()) {
         ShowInstallerHelp();
@@ -925,18 +924,23 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
         SetAppDataPath(i.appdataDir);
     }
 
+#if defined(DEBUG)
     if (i.testApp) {
         // in TestApp.cpp
         extern void TestApp(HINSTANCE hInstance);
         TestApp(hInstance);
         return 0;
     }
+#endif
 
     DetectExternalViewers();
 
     prefs::Load();
     UpdateGlobalPrefs(i);
     SetCurrentLang(i.lang ? i.lang : gGlobalPrefs->uiLanguage);
+
+    extern void ParseTranslationsFromResources(); // in Translations2.cpp
+    ParseTranslationsFromResources();
 
     // This allows ad-hoc comparison of gdi, gdi+ and gdi+ quick when used
     // in layout
@@ -947,10 +951,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
     goto Exit;
 #endif
 
+    bool didAllocateConsole{false};
     if (i.showConsole) {
-        RedirectIOToConsole();
-        // TODO(port)
-        // fz_redirect_dll_io_to_console();
+        didAllocateConsole = RedirectIOToConsole();
     }
 
     if (i.registerAsDefault) {
@@ -959,9 +962,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
 
     if (i.pathsToBenchmark.size() > 0) {
         BenchFileOrDir(i.pathsToBenchmark);
-        if (i.showConsole) {
-            system("pause");
-        }
     }
 
     if (i.exitImmediately) {
@@ -1032,12 +1032,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
         restoreSession = gGlobalPrefs->restoreSession;
     }
     if (gGlobalPrefs->reopenOnce->size() > 0 && !gPluginURL) {
-        if (gGlobalPrefs->reopenOnce->size() == 1 && str::EqI(gGlobalPrefs->reopenOnce->at(0), L"SessionData")) {
+        if (gGlobalPrefs->reopenOnce->size() == 1 && str::EqI(gGlobalPrefs->reopenOnce->at(0), "SessionData")) {
             gGlobalPrefs->reopenOnce->FreeMembers();
             restoreSession = true;
         }
         while (gGlobalPrefs->reopenOnce->size() > 0) {
-            i.fileNames.Append(gGlobalPrefs->reopenOnce->Pop());
+            char* s = gGlobalPrefs->reopenOnce->Pop();
+            // TODO: is this a leak?
+            WCHAR* sw = strconv::Utf8ToWstr(s);
+            i.fileNames.Append(sw);
         }
     }
 
@@ -1125,7 +1128,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
 
     if (i.stressTestPath) {
         // don't save file history and preference changes
-        RestrictPolicies(Perm_SavePreferences);
+        RestrictPolicies(Perm::SavePreferences);
         RebuildMenuBarForWindow(win);
         StartStressTest(&i, win);
         fastExit = true;
@@ -1140,7 +1143,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
         gFileExistenceChecker = new FileExistenceChecker();
         gFileExistenceChecker->Start();
     }
-    // call this once it's clear whether Perm_SavePreferences has been granted
+    // call this once it's clear whether Perm::SavePreferences has been granted
     prefs::RegisterForFileChanges();
 
     // Change current directory for 2 reasons:
@@ -1164,6 +1167,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, [[maybe_unused]] HINSTANCE hPrevInstan
 
 Exit:
     prefs::UnregisterForFileChanges();
+
+    if (i.showConsole) {
+        if (didAllocateConsole) {
+            // wait for user to press any key to close the console window
+            system("pause");
+        } else {
+            // simulate releasing console. the cursor still doesn't show up
+            // at the end of output, but it's better than nothing
+            SendEnterKeyToConsole();
+        }
+    }
 
     if (fastExit) {
         // leave all the remaining clean-up to the OS
@@ -1218,16 +1232,20 @@ Exit:
 
     delete gLogBuf;
     delete gLogAllocator;
+    DestroyTempAllocator();
 
+    if (gEnableMemLeak) {
+        // free(maybeLeak);
+        DumpMemLeaks();
+    }
+
+#if 0 // no longer seems to be needed in latest vs build, was probably early asan bug
     if (gIsAsanBuild) {
         // TODO: crashes in wild places without this
         // Note: ::ExitProcess(0) also crashes
         ::TerminateProcess(GetCurrentProcess(), 0);
     }
-
-    if (gEnableMemLeak) {
-        DumpMemLeaks();
-    }
+#endif
 
     return retCode;
 }
