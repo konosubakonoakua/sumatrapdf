@@ -1,171 +1,168 @@
-/* Copyright 2021 the SumatraPDF project authors (see AUTHORS file).
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-#include "utils/BaseUtil.h"
-#include "utils/WinDynCalls.h"
-#include "utils/Dpi.h"
-#include "utils/FileUtil.h"
-#include "utils/Timer.h"
-#include "utils/UITask.h"
-#include "utils/WinUtil.h"
-#include "AppColors.h"
-#include "utils/ScopedWin.h"
+#include "base/Base.h"
+#include "base/File.h"
+#include "base/Timer.h"
+#include "base/Win.h"
 
-#include "wingui/WinGui.h"
-#include "wingui/Layout.h"
-#include "wingui/Window.h"
-#include "wingui/TreeModel.h"
-#include "wingui/TreeCtrl.h"
-#include "wingui/FrameRateWnd.h"
+#include "gui/UIModels.h"
+#include "gui/Layout.h"
+#include "gui/win/WinGui.h"
+#include "gui/Gfx.h"
 
-#include "Annotation.h"
-#include "EngineBase.h"
-#include "EngineCreate.h"
-#include "Doc.h"
-
-#include "DisplayMode.h"
-#include "SettingsStructs.h"
-#include "Controller.h"
-#include "DisplayModel.h"
-#include "EbookController.h"
-#include "Theme.h"
-#include "GlobalPrefs.h"
-#include "RenderCache.h"
-#include "ProgressUpdateUI.h"
-#include "TextSelection.h"
-#include "TextSearch.h"
-#include "Notifications.h"
-#include "SumatraConfig.h"
+#include "Settings.h"
 #include "SumatraPDF.h"
-#include "WindowInfo.h"
-#include "TabInfo.h"
-#include "resource.h"
+#include "MainWindow.h"
 #include "Commands.h"
-#include "Canvas.h"
-#include "Caption.h"
 #include "Menu.h"
-#include "uia/Provider.h"
-#include "SearchAndDDE.h"
-#include "Selection.h"
-#include "SumatraAbout.h"
-#include "Tabs.h"
-#include "Toolbar.h"
-#include "Translations.h"
+#include "HomePage.h"
+#include "Theme.h"
+#include "FileHistory.h"
+#include "AppSettings.h"
+#include "Canvas.h"
 
-static void OnPaintAbout(WindowInfo* win) {
+int gHomePagePaintCount = 0;
+
+static void OnPaintAbout(MainWindow* win) {
     auto t = TimeGet();
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(win->hwndCanvas, &ps);
-
-    auto txtCol = GetAppColor(AppColor::MainWindowText);
-    auto bgCol = GetAppColor(AppColor::MainWindowBg);
-    if (HasPermission(Perm_SavePreferences | Perm_DiskAccess) && gGlobalPrefs->rememberOpenedFiles &&
-        gGlobalPrefs->showStartPage) {
-        DrawStartPage(win, win->buffer->GetDC(), gFileHistory, txtCol, bgCol);
-    } else {
-        DrawAboutPage(win, win->buffer->GetDC());
-    }
-    win->buffer->Flush(hdc);
-
-    EndPaint(win->hwndCanvas, &ps);
-    if (gShowFrameRate) {
-        win->frameRateWnd->ShowFrameRateDur(TimeSinceInMs(t));
-    }
-}
-
-static void OnMouseLeftButtonDownAbout(WindowInfo* win, int x, int y, [[maybe_unused]] WPARAM key) {
-    // lf("Left button clicked on %d %d", x, y);
-
-    // remember a link under so that on mouse up we only activate
-    // link if mouse up is on the same link as mouse down
-    win->urlOnLastButtonDown = GetStaticLink(win->staticLinks, x, y);
-}
-
-static bool IsLink(const WCHAR* url) {
-    if (str::StartsWithI(url, L"http:")) {
-        return true;
-    }
-    if (str::StartsWithI(url, L"https:")) {
-        return true;
-    }
-    if (str::StartsWithI(url, L"mailto:")) {
-        return true;
-    }
-    return false;
-}
-
-static void OnMouseLeftButtonUpAbout(WindowInfo* win, int x, int y, [[maybe_unused]] WPARAM key) {
-    SetFocus(win->hwndFrame);
-
-    const WCHAR* url = GetStaticLink(win->staticLinks, x, y);
-    const WCHAR* prevUrl = win->urlOnLastButtonDown;
-    win->urlOnLastButtonDown = nullptr;
-    if (!url || url != prevUrl) {
+    SetLayout(hdc, 0);
+    if (!win->buffer) {
+        EndPaint(win->hwndCanvas, &ps);
         return;
     }
-    if (str::Eq(url, SLINK_OPEN_FILE)) {
-        HwndSendCommand(win->hwndFrame, CmdOpen);
-    } else if (str::Eq(url, SLINK_LIST_HIDE)) {
-        gGlobalPrefs->showStartPage = false;
-        win->RedrawAll(true);
-    } else if (str::Eq(url, SLINK_LIST_SHOW)) {
-        gGlobalPrefs->showStartPage = true;
-        win->RedrawAll(true);
-    } else if (IsLink(url)) {
-        SumatraLaunchBrowser(url);
+    HDC bufDC = win->buffer->GetDC();
+    Settings* prefs = gSettings;
+    bool hasPerms = HasPermission(Perm::SavePreferences | Perm::DiskAccess);
+    bool drawHome = hasPerms && prefs->rememberOpenedFiles && prefs->showStartPage;
+    Gfx* gfx = GfxCreate(bufDC);
+    if (drawHome) {
+        DrawHomePage(win, gfx);
     } else {
-        // assume it's a document
-        LoadArgs args(url, win);
-        LoadDocument(args);
+        HomePageHideSearch(win);
+        // DrawAboutPage swaps the canvas root's child from the home page's
+        // chrome to the About page's controls
+        DrawAboutPage(win, gfx);
     }
+    delete gfx;
+    win->buffer->Flush(hdc);
+    DrawCanvasKeyboardFocusIfNeeded(win, hdc);
+
+    EndPaint(win->hwndCanvas, &ps);
+    if (drawHome) {
+        gHomePagePaintCount++;
+        HomePageRepaintWinScrollbar(win);
+    }
+    win->ShowFrameRateDur(TimeSinceInMs(t));
 }
 
-static void OnMouseRightButtonDownAbout(WindowInfo* win, int x, int y, [[maybe_unused]] WPARAM key) {
+static void OnMouseMoveAbout(HWND hwnd) {
+    TRACKMOUSEEVENT tme{sizeof(TRACKMOUSEEVENT)};
+    tme.dwFlags = TME_LEAVE;
+    tme.hwndTrack = hwnd;
+    TrackMouseEvent(&tme);
+}
+
+static void OnMouseRightButtonDownAbout(MainWindow* win, int x, int y, WPARAM /*key*/) {
     // lf("Right button clicked on %d %d", x, y);
-    SetFocus(win->hwndFrame);
+    HwndSetFocus(win->hwndFrame);
     win->dragStart = Point(x, y);
 }
 
-static void OnMouseRightButtonUpAbout(WindowInfo* win, int x, int y, [[maybe_unused]] WPARAM key) {
-    int isDrag = IsDrag(x, win->dragStart.x, y, win->dragStart.y);
+static void OnMouseRightButtonUpAbout(MainWindow* win, int x, int y, WPARAM /*key*/) {
+    int isDrag = IsDragDistance(x, win->dragStart.x, y, win->dragStart.y);
     if (isDrag) {
         return;
     }
     OnAboutContextMenu(win, x, y);
 }
 
-static LRESULT OnSetCursorAbout(WindowInfo* win, HWND hwnd) {
-    Point pt;
-    if (GetCursorPosInHwnd(hwnd, pt)) {
-        StaticLinkInfo linkInfo;
-        if (GetStaticLink(win->staticLinks, pt.x, pt.y, &linkInfo)) {
-            win->ShowToolTip(linkInfo.infotip, linkInfo.rect);
-            SetCursorCached(IDC_HAND);
-        } else {
-            win->HideToolTip();
-            SetCursorCached(IDC_ARROW);
-        }
+static LRESULT OnSetCursorAbout(MainWindow* win, HWND hwnd) {
+    LRESULT res = 0;
+    if (HomePageOnCanvasMessage(win, WM_SETCURSOR, 0, 0, res)) {
         return TRUE;
     }
-
-    win->HideToolTip();
-    return FALSE;
+    Point pt = HwndGetCursorPos(hwnd);
+    if (pt.IsEmpty()) {
+        win->DeleteToolTip();
+        return FALSE;
+    }
+    // not over any virtual control: plain arrow, and drop the hover tip. The
+    // keyboard selection outline stays
+    win->DeleteToolTip();
+    SetCursorCached(IDC_ARROW);
+    return TRUE;
 }
 
-LRESULT WndProcCanvasAbout(WindowInfo* win, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+LRESULT WndProcCanvasAbout(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     int x = GET_X_LPARAM(lp);
     int y = GET_Y_LPARAM(lp);
+    // the home page's virtual controls (header, view buttons, "Open a
+    // document...", help button) handle their own hover / click / cursor
     switch (msg) {
+        case WM_MOUSEMOVE:
+        case WM_MOUSELEAVE:
         case WM_LBUTTONDOWN:
-            OnMouseLeftButtonDownAbout(win, x, y, wp);
-            return 0;
-
         case WM_LBUTTONUP:
-            OnMouseLeftButtonUpAbout(win, x, y, wp);
+        case WM_LBUTTONDBLCLK: {
+            LRESULT res = 0;
+            if (HomePageOnCanvasMessage(win, msg, wp, lp, res)) {
+                return res;
+            }
+            break;
+        }
+    }
+    // the search box's own messages (WM_CTLCOLOREDIT, EN_CHANGE, focus) are
+    // reflected back to it by WndProcCanvas; it colors itself from SetColors()
+    // and calls the handlers HomePage.cpp gave it
+    switch (msg) {
+        case WM_KEYDOWN:
+            // keyboard navigation of the file list (issue #1136). These keys are
+            // routed here by MaybeTranslateAccelerator instead of scrolling
+            switch (wp) {
+                case VK_LEFT:
+                    HomePageMoveSelection(win, -1, 0);
+                    return 0;
+                case VK_RIGHT:
+                    HomePageMoveSelection(win, 1, 0);
+                    return 0;
+                case VK_UP:
+                    HomePageMoveSelection(win, 0, -1);
+                    return 0;
+                case VK_DOWN:
+                    HomePageMoveSelection(win, 0, 1);
+                    return 0;
+                case VK_RETURN: {
+                    Str path = HomePageSelectedFilePathTemp(win);
+                    if (len(path) == 0) {
+                        return 0;
+                    }
+                    LoadArgs args(path, win);
+                    // ctrl forces always opening, as for a click
+                    args.activateExisting = !IsCtrlPressed();
+                    args.activateExistingInWindow = true;
+                    StartLoadDocument(&args);
+                    return 0;
+                }
+                case VK_DELETE: {
+                    // remove the keyboard-selected entry from file history (not from disk)
+                    Str path = HomePageSelectedFilePathTemp(win);
+                    if (path) {
+                        ForgetFileFromFrequentlyRead(win, path);
+                    }
+                    return 0;
+                }
+            }
+            break;
+
+        case WM_MOUSEMOVE:
+            OnMouseMoveAbout(hwnd);
             return 0;
 
-        case WM_LBUTTONDBLCLK:
-            OnMouseLeftButtonDownAbout(win, x, y, wp);
+        case WM_MOUSELEAVE:
+            HomePageClearActiveEntry(win);
             return 0;
 
         case WM_RBUTTONDOWN:
@@ -187,10 +184,31 @@ LRESULT WndProcCanvasAbout(WindowInfo* win, HWND hwnd, UINT msg, WPARAM wp, LPAR
             return 0;
 
         case WM_PAINT:
+            if (gRedrawLog) {
+                logf("redraw: WM_PAINT hwnd=0x%p (canvas-about)\n", hwnd);
+            }
             OnPaintAbout(win);
+            return 0;
+
+        case WM_VSCROLL:
+            HomePageClearActiveEntry(win);
+            HomePageOnVScroll(win, wp);
+            return 0;
+
+        case WM_MOUSEWHEEL: {
+            HomePageClearActiveEntry(win);
+            int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            HomePageOnMouseWheel(win, delta);
+            return 0;
+        }
+
+        // nothing scrolls sideways; DefWindowProc hands it to the frame, which
+        // sends it back here until the stack overflows
+        case WM_MOUSEHWHEEL:
             return 0;
 
         default:
             return DefWindowProc(hwnd, msg, wp, lp);
     }
+    return DefWindowProc(hwnd, msg, wp, lp);
 }

@@ -1,48 +1,54 @@
-/* Copyright 2021 the SumatraPDF project authors (see AUTHORS file).
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-#define INSTALLER_FRAME_CLASS_NAME L"SUMATRA_PDF_INSTALLER_FRAME"
+struct VirtRoot;
 
-#define BROWSER_PLUGIN_NAME L"npPdfViewer.dll"
-#define SEARCH_FILTER_DLL_NAME L"PdfFilter.dll"
-#define PREVIEW_DLL_NAME L"PdfPreview.dll"
+constexpr int kInstallerWinDy = 340;
 
-#define INSTALLER_WIN_DX 420
-#define INSTALLER_WIN_DY 340
+// DWORD 0|1 in the uninstall key: whether the install created a desktop shortcut
+#define kRegDesktopShortcut "DesktopShortcut"
 
-#define WIN_BG_COLOR RGB(0xff, 0xf2, 0) // yellow
+enum class PreviousInstallationType {
+    None = 0,
+    User = 1,
+    Machine = 2,
+    Both = 3
+};
 
-// TODO: should scale
-#define WINDOW_MARGIN DpiScale(8)
+struct PreviousInstallationInfo {
+    Str installationDir;
+    PreviousInstallationType typ = PreviousInstallationType::None;
+    bool searchFilterInstalled = false;
+    bool previewInstalled = false;
+    bool thumbnailsInstalled = false;
+    // other apps' handlers, a bit per extension (see PreviewHandlers)
+    u32 foreignPreview = 0;
+    u32 foreignThumbnails = 0;
+    bool allUsers = false;
+    // installs before the DesktopShortcut registry value always created one
+    bool desktopShortcut = true;
 
-/* The window is divided in three parts:
-- top part, where we display nice graphics
-- middle part, where we either display messages or advanced options
-- bottom part, with install/uninstall button
-*/
+    PreviousInstallationInfo() = default;
+    ~PreviousInstallationInfo();
+};
 
 // This is the height of the lower part
 extern int gBottomPartDy;
 
 extern int gButtonDy;
 
-#define WM_APP_INSTALLATION_FINISHED (WM_APP + 1)
+constexpr int kWmAppInstallationFinished = (WM_APP + 1);
+constexpr int kWmAppStartInstallation = (WM_APP + 2);
 
-struct ButtonCtrl;
-
-extern WCHAR* firstError;
-extern Flags* gCli;
-extern const WCHAR* gDefaultMsg;
+extern Str gFirstError;
+extern Str gDefaultMsg;
 extern HWND gHwndFrame;
-extern HFONT gFontDefault;
-extern WCHAR* gMsgError;
-extern bool gShowOptions;
-extern bool gReproBug;
+extern Str gMsgError;
 
-extern Gdiplus::Color COLOR_MSG_WELCOME;
-extern Gdiplus::Color COLOR_MSG_OK;
-extern Gdiplus::Color COLOR_MSG_INSTALLATION;
-extern Gdiplus::Color COLOR_MSG_FAILED;
+extern Gdiplus::Color kColorMsgWelcome;
+extern Gdiplus::Color kColorMsgOk;
+extern Gdiplus::Color kColorMsgInstallation;
+extern Gdiplus::Color kColorMsgFailed;
 extern Gdiplus::Color gCol1;
 extern Gdiplus::Color gCol1Shadow;
 extern Gdiplus::Color gCol2;
@@ -54,35 +60,73 @@ extern Gdiplus::Color gCol4Shadow;
 extern Gdiplus::Color gCol5;
 extern Gdiplus::Color gCol5Shadow;
 
-ButtonCtrl* CreateDefaultButtonCtrl(HWND hwndParent, const WCHAR* s);
-void InitInstallerUninstaller();
-void OnPaintFrame(HWND hwnd);
+// virt: the window's virtual controls, painted on top of the frame (can be null)
+void OnPaintFrame(HWND hwnd, bool skipMessage, VirtRoot* virt = nullptr);
 void AnimStep();
-void NotifyFailed(const WCHAR* msg);
-void SetMsg(const WCHAR* msg, Gdiplus::Color color);
+
+void NotifyFailed(Str msg);
+
+void SetMsg(Str msg, Gdiplus::Color color);
 void SetDefaultMsg();
 
-int KillProcessesWithModule(const WCHAR* modulePath, bool waitUntilTerminated);
+int KillProcessesWithModule(Str modulePath, bool waitUntilTerminated);
 
-const WCHAR** GetSupportedExts();
+TempStr GetShortcutPathTemp(int csidl);
 
-WCHAR* GetShortcutPath(int csidl);
+bool ExtractInstallerFiles(Str dir);
+bool ExtractLibsumatrapdfToDir(Str destDir);
 
-WCHAR* GetExistingInstallationDir();
-WCHAR* GetInstallDirNoFree();
-WCHAR* GetInstalledExePath();
+TempStr GetExistingInstallationDirTemp();
+void GetPreviousInstallInfo(PreviousInstallationInfo* info);
+bool IsOurExeInstalled();
 
-WCHAR* GetInstallationFilePath(const WCHAR* name);
-WCHAR* GetExistingInstallationFilePath(const WCHAR* name);
+bool IsPathUnderProgramFiles(Str path);
+bool InstallNeedsElevation(Str installDir, bool allUsers);
 
-void RegisterPreviewer(bool silent);
-void UnRegisterPreviewer(bool silent);
-bool IsPreviewerInstalled();
+TempStr GetInstallationFilePathTemp(Str installDir, Str name);
 
-void RegisterSearchFilter(bool silent);
-void UnRegisterSearchFilter(bool silent);
-bool IsSearchFilterInstalled();
+struct PreviewHandlers;
+void RegisterPreviewer(bool allUsers, Str installDir, const PreviewHandlers& which);
+void UnRegisterPreviewer();
 
-void UninstallBrowserPlugin();
+void RegisterSearchFilter(bool allUsers, Str installDir);
+void UnRegisterSearchFilter();
+
+// Unregister shell extensions and kill processes holding install-dir files
+// so ExtractInstallerFiles can overwrite PdfFilter.dll / PdfPreview.dll / etc.
+// Call before extracting over an existing install. removedOut (optional) is
+// filled for RestoreShellExtensions if install fails later.
+struct ShellExtInstallState {
+    bool searchFilter = false;
+    // our preview pane / thumbnail handlers, a bit per extension
+    u32 ourPreview = 0;
+    u32 ourThumbnails = 0;
+    bool allUsers = false;
+    Str installDir;
+};
+void FreeInstallationFilesInUse(Str installDir, bool allUsers, ShellExtInstallState* removedOut = nullptr);
+void RestoreShellExtensions(const ShellExtInstallState& state);
 
 bool CheckInstallUninstallPossible(bool silent = false);
+Str GetInstallerLogPath();
+
+bool IsDirInPath(Str path, Str dir);
+bool WriteRegExpandSz(HKEY root, Str keyName, Str valueName, Str value);
+
+TempStr GetRegPathUninstTemp(Str appName);
+
+void RemoveAppShortcuts();
+
+bool WriteUninstallerRegistryInfo(HKEY hkey, bool allUsers, Str installDir);
+bool WriteExtendedFileExtensionInfo(HKEY hkey, Str installedExePath);
+bool RemoveUninstallerRegistryInfo(HKEY hkey);
+void RemoveInstallRegistryKeys(HKEY hkey);
+int GetInstallerWinDx();
+
+void ReRegisterFileAssociations();
+void LogNonDefaultRegisteredExtensions();
+void CollectNonDefaultRegisteredExtensions(StrVec& out);
+void LaunchDefaultAppDialogForExtension(HWND hwnd, Str ext);
+bool InstallerWmCommand(WPARAM wp, void (*onExit)());
+int RunInstaller();
+int RunUninstaller();

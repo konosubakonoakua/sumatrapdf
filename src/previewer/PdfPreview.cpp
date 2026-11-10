@@ -1,39 +1,138 @@
-/* Copyright 2021 the SumatraPDF project authors (see AUTHORS file).
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-#include "utils/BaseUtil.h"
-#include "utils/ScopedWin.h"
-#include "utils/WinUtil.h"
-#include "utils/LogDbg.h"
+#include "base/Base.h"
+#include "base/Archive.h"
+#include "base/Pixmap.h"
+#include "base/AutoWin.h"
+#include "base/GdiPlusUtil.h"
+#include "base/Win.h"
+#include "gui/PlatformFont.h"
+#include "gui/PlatformText.h"
+#include "gui/Dpi.h"
 
-#include "wingui/TreeModel.h"
+#include "gui/UIModels.h"
 
-#include "Annotation.h"
+#include "Settings.h"
+#include "DocController.h"
 #include "EngineBase.h"
-#include "EnginePdf.h"
-#include "EngineXps.h"
-#include "mui/MiniMui.h"
-#include "EngineEbook.h"
-#include "EngineImages.h"
-#include "PdfPreview.h"
-#include "PdfPreviewBase.h"
+#include "base/GuessFileType.h"
+#include "EngineAll.h"
+#include "Annotation.h"
+#include "RegistryPreview.h"
 
-IFACEMETHODIMP PreviewBase::GetThumbnail(uint cx, HBITMAP* phbmp, WTS_ALPHATYPE* pdwAlpha) {
+#include "PdfPreview.h"
+
+constexpr Color kColWindowBg = MkRgb(0x99, 0x99, 0x99);
+constexpr Color kColPageNoBg = MkRgb(0x33, 0x33, 0x33);
+constexpr Color kColPageNoText = MkRgb(0xff, 0xff, 0xff);
+constexpr int kPreviewMargin = 2;
+constexpr UINT kUwmPaintAgain = (WM_USER + 101);
+// Engine-scale zoom (1 = 100%). Below fit-page we snap back to fit.
+constexpr float kPreviewZoomMin = 0.1f;
+constexpr float kPreviewZoomMax = 16.f;
+constexpr float kPreviewZoomStep = 1.2f;
+// Render the whole page when it stays under this many pixels (~32 MB at 32bpp).
+// Past that, only the visible region plus a pan slop is rendered.
+constexpr i64 kPreviewMaxFullPagePixels = 8LL * 1024 * 1024;
+constexpr int kPreviewPanPad = 256;
+
+static bool SameZoom(float a, float b) {
+    return fabsf(a - b) < 0.0001f;
+}
+
+static PdfPreview* PreviewFromHwnd(HWND hwnd) {
+    return (PdfPreview*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+}
+
+EBookUI* GetEBookUI() {
+    return nullptr;
+}
+
+FileEBookUI* GetFileEBookUI(Str) {
+    return nullptr;
+}
+
+// Copy a rendered page into the 32bpp DIB the shell gets, rather than going
+// through GetDIBits(bmp->hbmp): only the mupdf engines render into a DIB
+// section, so for DjVu and the image engines hbmp is null and GetDIBits failed,
+// which is why those never had a thumbnail (issue #1530). The caller makes
+// the pixels BGRA8 first: mupdf renders a page with few colors to an 8-bit
+// palette DIB, whose bytes are indices, not colors.
+// Rows are written bottom-up (the DIB has a positive biHeight) and anything
+// translucent is composited over white, the same paper the preview window
+// paints behind a page. Alpha ends up opaque, matching WTSAT_RGB:
+// cf. http://msdn.microsoft.com/en-us/library/bb774612(v=VS.85).aspx
+static void CopyPixmapToThumbnail(const Pixmap* bmp, u8* dst, int dx, int dy) {
+    int srcBpp = PixmapBytesPerPixel(bmp->format);
+    bool isRgb = bmp->format == PixmapFormat::RGBA8;
+    bool hasAlpha = srcBpp == 4;
+    bool premul = bmp->premultiplied;
+    for (int y = 0; y < dy; y++) {
+        const u8* src = bmp->data + ((size_t)y * (size_t)bmp->stride);
+        u8* row = dst + ((size_t)(dy - 1 - y) * (size_t)dx * 4);
+        for (int x = 0; x < dx; x++) {
+            int c0 = src[0], c1 = src[1], c2 = src[2];
+            int b = isRgb ? c2 : c0;
+            int r = isRgb ? c0 : c2;
+            int g = c1;
+            int a = hasAlpha ? src[3] : 255;
+            if (a != 255) {
+                int inv = 255 - a;
+                if (premul) {
+                    b += inv;
+                    g += inv;
+                    r += inv;
+                } else {
+                    b = ((b * a) + (255 * inv)) / 255;
+                    g = ((g * a) + (255 * inv)) / 255;
+                    r = ((r * a) + (255 * inv)) / 255;
+                }
+            }
+            row[0] = (u8)std::min(b, 255);
+            row[1] = (u8)std::min(g, 255);
+            row[2] = (u8)std::min(r, 255);
+            row[3] = 0xFF;
+            src += srcBpp;
+            row += 4;
+        }
+    }
+}
+
+IFACEMETHODIMP PdfPreview::GetThumbnail(uint cx, HBITMAP* phbmp, WTS_ALPHATYPE* pdwAlpha) {
     EngineBase* engine = GetEngine();
     if (!engine) {
+        logf("PdfPreview::GetThumbnail: failed to get the engine\n");
         return E_FAIL;
     }
 
-    dbglogf("PdfPreview: PreviewBase::GetThumbnail(cx=%d)\n", (int)cx);
+    logf("PdfPreview::GetThumbnail(cx=%d, engine: %s\n", (int)cx, Str(engine->kind));
 
     RectF page = engine->Transform(engine->PageMediabox(1), 1, 1.0, 0);
-    float zoom = std::min(cx / (float)page.dx, cx / (float)page.dy) - 0.001f;
+    float zoom = std::min((float)cx / page.dx, (float)cx / page.dy) - 0.001f;
     Rect thumb = RectF(0, 0, page.dx * zoom, page.dy * zoom).Round();
 
-    BITMAPINFO bmi = {0};
+    page = engine->Transform(ToRectF(thumb), 1, zoom, 0, true);
+    RenderPageArgs args(1, zoom, 0, &page);
+    Pixmap* bmp = PixmapToBgra(engine->RenderPage(args));
+    if (!bmp || !bmp->data) {
+        log(StrL("PdfPreview::GetThumbnail: RenderPage() failed\n"));
+        FreePixmap(bmp);
+        return E_FAIL;
+    }
+    defer {
+        FreePixmap(bmp);
+    };
+
+    // Size the bitmap from what was actually rendered: rounding can put it a
+    // pixel off `thumb`, and copying with the wrong dimensions shears the image.
+    int dx = bmp->width;
+    int dy = bmp->height;
+
+    BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-    bmi.bmiHeader.biHeight = thumb.dy;
-    bmi.bmiHeader.biWidth = thumb.dx;
+    bmi.bmiHeader.biHeight = dy;
+    bmi.bmiHeader.biWidth = dx;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -41,88 +140,95 @@ IFACEMETHODIMP PreviewBase::GetThumbnail(uint cx, HBITMAP* phbmp, WTS_ALPHATYPE*
     u8* bmpData = nullptr;
     HBITMAP hthumb = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, (void**)&bmpData, nullptr, 0);
     if (!hthumb) {
+        log(StrL("PdfPreview::GetThumbnail: CreateDIBSection() failed\n"));
         return E_OUTOFMEMORY;
     }
 
-    page = engine->Transform(ToRectFl(thumb), 1, zoom, 0, true);
-    RenderPageArgs args(1, zoom, 0, &page);
-    RenderedBitmap* bmp = engine->RenderPage(args);
+    CopyPixmapToThumbnail(bmp, bmpData, dx, dy);
 
-    HDC hdc = GetDC(nullptr);
-    if (bmp && GetDIBits(hdc, bmp->GetBitmap(), 0, thumb.dy, bmpData, &bmi, DIB_RGB_COLORS)) {
-        // cf. http://msdn.microsoft.com/en-us/library/bb774612(v=VS.85).aspx
-        for (int i = 0; i < thumb.dx * thumb.dy; i++) {
-            bmpData[4 * i + 3] = 0xFF;
-        }
-
-        *phbmp = hthumb;
-        if (pdwAlpha) {
-            *pdwAlpha = WTSAT_RGB;
-        }
-    } else {
-        DeleteObject(hthumb);
-        hthumb = nullptr;
+    *phbmp = hthumb;
+    if (pdwAlpha) {
+        *pdwAlpha = WTSAT_RGB;
     }
-
-    ReleaseDC(nullptr, hdc);
-    delete bmp;
-
-    return hthumb ? S_OK : E_NOTIMPL;
+    log(StrL("PdfPreview::GetThumbnail: provided thumbnail\n"));
+    return S_OK;
 }
 
-#define COL_WINDOW_BG RGB(0x99, 0x99, 0x99)
-#define PREVIEW_MARGIN 2
-#define UWM_PAINT_AGAIN (WM_USER + 101)
+// Page at userZoom (or fit), pan when it is larger than the pane.
+// userZoom == 0 means "fit page". Zooming back to fit-or-smaller snaps to fit.
+struct PreviewLayout {
+    Rect content;
+    RectF page;
+    float fitZoom = 0;
+    float zoom = 0;
+    Rect onScreen;
+    Rect visible;
+    bool canPanX = false;
+    bool canPanY = false;
+};
+
+static void ResetPreviewView(PdfPreview* preview) {
+    if (!preview) {
+        return;
+    }
+    preview->userZoom = 0;
+    preview->panX = 0;
+    preview->panY = 0;
+    preview->panning = false;
+}
 
 class PageRenderer {
-    EngineBase* engine;
-    HWND hwnd;
+    EngineBase* engine = nullptr;
+    HWND hwnd = nullptr;
 
-    int currPage;
-    RenderedBitmap* currBmp;
-    // due to rounding differences, currBmp->Size() and currSize can differ slightly
-    Size currSize;
-    int reqPage;
-    float reqZoom;
-    Size reqSize;
-    bool reqAbort;
-    AbortCookie* abortCookie;
+    int currPage = 0;
+    float currZoom = 0.f;
+    Rect currClip;
+    Pixmap* currBmp = nullptr;
+    int reqPage = 0;
+    float reqZoom = 0.f;
+    Rect reqClip;
+    RectF reqPageRect;
+    bool reqUseClip = false;
+    bool reqAbort = false;
+    AbortCookie* volatile abortCookie = nullptr;
 
-    CRITICAL_SECTION currAccess;
-    HANDLE thread;
+    Mutex currAccess;
+    ThreadHandle thread = nullptr;
 
     // seeking inside an IStream spins an inner event loop
     // which can cause reentrance in OnPaint and leave an
     // engine semi-initialized when it's called recursively
     // (this only applies for the UI thread where the critical
     // sections can't prevent recursion without the risk of deadlock)
-    bool preventRecursion;
+    bool preventRecursion = false;
 
   public:
-    PageRenderer(EngineBase* engine, HWND hwnd)
-        : engine(engine),
-          hwnd(hwnd),
-          currPage(0),
-          currBmp(nullptr),
-          reqPage(0),
-          reqZoom(0),
-          reqAbort(false),
-          abortCookie(nullptr),
-          thread(nullptr),
-          preventRecursion(false) {
-        InitializeCriticalSection(&currAccess);
+    PageRenderer(EngineBase* engine, HWND hwnd) {
+        this->engine = engine;
+        this->hwnd = hwnd;
     }
     ~PageRenderer() {
-        if (thread) {
-            WaitForSingleObject(thread, INFINITE);
+        ThreadHandle th = nullptr;
+        {
+            AutoUnlockMutex scope(&currAccess);
+            if (abortCookie) {
+                abortCookie->Abort();
+            }
+            reqAbort = true;
+            th = thread;
+            thread = nullptr;
         }
-        delete currBmp;
-        DeleteCriticalSection(&currAccess);
+        if (th) {
+            WaitForSingleObject(th, INFINITE);
+            SafeCloseThreadHandle(&th);
+        }
+        FreePixmap(currBmp);
     }
 
     RectF GetPageRect(int pageNo) {
         if (preventRecursion) {
-            return RectF();
+            return {};
         }
 
         preventRecursion = true;
@@ -133,79 +239,246 @@ class PageRenderer {
         return bbox;
     }
 
-    void Render(HDC hdc, Rect target, int pageNo, float zoom) {
-        dbglog("PdfPreview: PageRenderer::Render()\n");
-
-        ScopedCritSec scope(&currAccess);
-        if (currBmp && currPage == pageNo && currSize == target.Size()) {
-            currBmp->StretchDIBits(hdc, target);
-        } else if (!thread) {
-            reqPage = pageNo;
-            reqZoom = zoom;
-            reqSize = target.Size();
-            reqAbort = false;
-            thread = CreateThread(nullptr, 0, RenderThread, this, 0, 0);
-        } else if (reqPage != pageNo || reqSize != target.Size()) {
-            if (abortCookie) {
-                abortCookie->Abort();
-            }
-            reqAbort = true;
-        }
-    }
+    void Render(HDC hdc, const PreviewLayout& lo, int pageNo);
 
   protected:
+    RectF ScreenToPage(int pageNo, float zoom, RectF screen) {
+        if (preventRecursion) {
+            return {};
+        }
+        preventRecursion = true;
+        RectF r = engine->Transform(screen, pageNo, zoom, 0, true);
+        preventRecursion = false;
+        return r;
+    }
+
+    static bool ClipCovers(int page, float zoom, Rect clip, int wantPage, float wantZoom, Rect visInPage) {
+        return page == wantPage && SameZoom(zoom, wantZoom) && clip.Intersect(visInPage) == visInPage;
+    }
+
+    static void BlitCached(HDC hdc, Pixmap* bmp, Rect clip, Rect visInPage, Rect onScreen) {
+        if (!bmp) {
+            return;
+        }
+        Rect overlap = clip.Intersect(visInPage);
+        if (overlap.IsEmpty()) {
+            return;
+        }
+        Rect src(overlap.x - clip.x, overlap.y - clip.y, overlap.dx, overlap.dy);
+        src = src.Intersect(Rect(0, 0, bmp->width, bmp->height));
+        if (src.IsEmpty()) {
+            return;
+        }
+        Rect dst(onScreen.x + clip.x + src.x, onScreen.y + clip.y + src.y, src.dx, src.dy);
+        BlitPixmapRegion(bmp, hdc, dst, src);
+    }
+
+    // Once pr->thread is null nothing waits for this thread, so the host may
+    // unload the DLL while it still runs: hold a module ref until it exits.
     static DWORD WINAPI RenderThread(LPVOID data) {
-        ScopedCom comScope; // because the engine reads data from a COM IStream
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&RenderThread, &self);
+        RenderThreadBody(data);
+        if (self) {
+            FreeLibraryAndExitThread(self, 0);
+        }
+        return 0;
+    }
+
+    static void RenderThreadBody(LPVOID data) {
+        log(StrL("PageRenderer::RenderThread started\n"));
+        AutoCoUninitialize comScope; // because the engine reads data from a COM IStream
 
         PageRenderer* pr = (PageRenderer*)data;
-        RenderPageArgs args(pr->reqPage, pr->reqZoom, 0, nullptr, RenderTarget::View, &pr->abortCookie);
-        RenderedBitmap* bmp = pr->engine->RenderPage(args);
+        RenderPageArgs args(pr->reqPage, pr->reqZoom, 0, pr->reqUseClip ? &pr->reqPageRect : nullptr,
+                            RenderTarget::View, (AbortCookie**)&pr->abortCookie);
+        Pixmap* bmp = pr->engine->RenderPage(args);
 
-        ScopedCritSec scope(&pr->currAccess);
+        AbortCookie* toDelete = nullptr;
+        ThreadHandle th = nullptr;
+        HWND hwnd = nullptr;
+        {
+            AutoUnlockMutex scope(&pr->currAccess);
+            if (bmp && !pr->reqAbort) {
+                FreePixmap(pr->currBmp);
+                pr->currBmp = bmp;
+                pr->currPage = pr->reqPage;
+                pr->currZoom = pr->reqZoom;
+                pr->currClip = pr->reqClip;
+            } else {
+                FreePixmap(bmp);
+            }
+            toDelete = pr->abortCookie;
+            pr->abortCookie = nullptr;
 
-        if (!pr->reqAbort) {
-            delete pr->currBmp;
-            pr->currBmp = bmp;
-            pr->currPage = pr->reqPage;
-            pr->currSize = pr->reqSize;
-        } else {
-            delete bmp;
+            // once thread is null ~PageRenderer won't wait for us, so don't touch pr after this
+            th = pr->thread;
+            pr->thread = nullptr;
+            hwnd = pr->hwnd;
         }
-        delete pr->abortCookie;
-        pr->abortCookie = nullptr;
+        delete toDelete;
 
-        HANDLE th = pr->thread;
-        pr->thread = nullptr;
-        PostMessageW(pr->hwnd, UWM_PAINT_AGAIN, 0, 0);
+        PostMessageW(hwnd, kUwmPaintAgain, 0, 0);
 
-        CloseHandle(th);
-        return 0;
+        SafeCloseThreadHandle(&th);
+        DestroyTempArena();
     }
 };
 
+void PageRenderer::Render(HDC hdc, const PreviewLayout& lo, int pageNo) {
+    if (lo.visible.IsEmpty() || lo.zoom <= 0) {
+        return;
+    }
+
+    Rect visInPage(lo.visible.x - lo.onScreen.x, lo.visible.y - lo.onScreen.y, lo.visible.dx, lo.visible.dy);
+    Rect pageRectPx(0, 0, lo.onScreen.dx, lo.onScreen.dy);
+    visInPage = visInPage.Intersect(pageRectPx);
+    if (visInPage.IsEmpty()) {
+        return;
+    }
+
+    i64 fullPixels = (i64)lo.onScreen.dx * (i64)lo.onScreen.dy;
+    Rect wantClip;
+    if (fullPixels > 0 && fullPixels <= kPreviewMaxFullPagePixels) {
+        wantClip = pageRectPx;
+    } else {
+        wantClip = visInPage;
+        wantClip.Inflate(kPreviewPanPad, kPreviewPanPad);
+        wantClip = wantClip.Intersect(pageRectPx);
+    }
+
+    AutoUnlockMutex scope(&currAccess);
+
+    if (currBmp && ClipCovers(currPage, currZoom, currClip, pageNo, lo.zoom, visInPage)) {
+        BlitCached(hdc, currBmp, currClip, visInPage, lo.onScreen);
+        return;
+    }
+
+    if (currBmp && currPage == pageNo && SameZoom(currZoom, lo.zoom)) {
+        BlitCached(hdc, currBmp, currClip, visInPage, lo.onScreen);
+    }
+
+    if (!thread) {
+        bool useClip = wantClip != pageRectPx;
+        RectF pageClip;
+        if (useClip) {
+            RectF screenClip((float)wantClip.x, (float)wantClip.y, (float)wantClip.dx, (float)wantClip.dy);
+            pageClip = ScreenToPage(pageNo, lo.zoom, screenClip);
+            if (pageClip.IsEmpty()) {
+                return;
+            }
+        }
+        reqPage = pageNo;
+        reqZoom = lo.zoom;
+        reqClip = wantClip;
+        reqPageRect = pageClip;
+        reqUseClip = useClip;
+        reqAbort = false;
+        thread = CreateThread(nullptr, 0, RenderThread, this, 0, nullptr);
+    } else if (!ClipCovers(reqPage, reqZoom, reqClip, pageNo, lo.zoom, visInPage)) {
+        if (abortCookie) {
+            abortCookie->Abort();
+        }
+        reqAbort = true;
+    }
+}
+
+static PreviewLayout ComputePreviewLayout(HWND hwnd, PdfPreview* preview, int pageNo) {
+    PreviewLayout lo;
+    lo.content = HwndClientRect(hwnd);
+    lo.content.Inflate(-kPreviewMargin, -kPreviewMargin);
+    if (!preview || !preview->renderer || lo.content.IsEmpty()) {
+        return lo;
+    }
+    lo.page = preview->renderer->GetPageRect(pageNo);
+    if (lo.page.IsEmpty() || lo.page.dx <= 0 || lo.page.dy <= 0) {
+        return lo;
+    }
+    lo.fitZoom = std::min((float)lo.content.dx / lo.page.dx, (float)lo.content.dy / lo.page.dy) - 0.001f;
+    if (lo.fitZoom < kPreviewZoomMin) {
+        lo.fitZoom = kPreviewZoomMin;
+    }
+    if (preview->userZoom > 0 && preview->userZoom <= lo.fitZoom) {
+        preview->userZoom = 0;
+        preview->panX = 0;
+        preview->panY = 0;
+    }
+    lo.zoom = preview->userZoom > 0 ? preview->userZoom : lo.fitZoom;
+    Rect pagePx = RectF(0, 0, lo.page.dx * lo.zoom, lo.page.dy * lo.zoom).Round();
+    lo.canPanX = pagePx.dx > lo.content.dx;
+    lo.canPanY = pagePx.dy > lo.content.dy;
+    if (lo.canPanX) {
+        preview->panX = limitValue(preview->panX, lo.content.dx - pagePx.dx, 0);
+        lo.onScreen.x = lo.content.x + preview->panX;
+    } else {
+        preview->panX = 0;
+        lo.onScreen.x = lo.content.x + ((lo.content.dx - pagePx.dx) / 2);
+    }
+    if (lo.canPanY) {
+        preview->panY = limitValue(preview->panY, lo.content.dy - pagePx.dy, 0);
+        lo.onScreen.y = lo.content.y + preview->panY;
+    } else {
+        preview->panY = 0;
+        lo.onScreen.y = lo.content.y + ((lo.content.dy - pagePx.dy) / 2);
+    }
+    lo.onScreen.dx = pagePx.dx;
+    lo.onScreen.dy = pagePx.dy;
+    lo.visible = lo.onScreen.Intersect(lo.content);
+    return lo;
+}
+
+// "3 / 120" in the bottom-right corner: shows the page count without opening the file
+static void DrawPageNumber(HWND hwnd, HDC hdc, Rect client) {
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_POS | SIF_RANGE;
+    if (!GetScrollInfo(hwnd, SB_VERT, &si)) {
+        return;
+    }
+    NONCLIENTMETRICS ncm{};
+    if (!GetNonClientMetricsForDpi(DpiGetForHwnd(hwnd), &ncm)) {
+        return;
+    }
+
+    TempStr s = fmt("%d / %d", si.nPos, si.nMax);
+    HFONT font = CreateFontIndirectW(&ncm.lfMessageFont);
+    uint format = DT_SINGLELINE | DT_NOPREFIX;
+    Size sz = HdcMeasureText(hdc, s, client.dx, format, font);
+    int pad = sz.dy / 4;
+    int dx = sz.dx + 4 * pad;
+    int dy = sz.dy + 2 * pad;
+    Rect r(client.x + client.dx - dx - 2 * pad, client.y + client.dy - dy - 2 * pad, dx, dy);
+
+    HBRUSH brush = CreateSolidBrush(kColPageNoBg);
+    HdcFillRect(hdc, r, brush);
+    DeleteObject(brush);
+
+    int prevMode = SetBkMode(hdc, TRANSPARENT);
+    COLORREF prevCol = SetTextColor(hdc, kColPageNoText);
+    HdcDrawText(hdc, s, r, format | DT_CENTER | DT_VCENTER, font);
+    SetTextColor(hdc, prevCol);
+    SetBkMode(hdc, prevMode);
+    DeleteObject(font);
+}
+
 static LRESULT OnPaint(HWND hwnd) {
-    Rect rect = ClientRect(hwnd);
+    Rect rect = HwndClientRect(hwnd);
     DoubleBuffer buffer(hwnd, rect);
     HDC hdc = buffer.GetDC();
-    HBRUSH brushBg = CreateSolidBrush(COL_WINDOW_BG);
+    HBRUSH brushBg = CreateSolidBrush(kColWindowBg);
     HBRUSH brushWhite = GetStockBrush(WHITE_BRUSH);
     RECT rcClient = ToRECT(rect);
-    FillRect(hdc, &rcClient, brushBg);
+    HdcFillRect(hdc, ToRect(rcClient), brushBg);
 
-    PreviewBase* preview = (PreviewBase*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    PdfPreview* preview = PreviewFromHwnd(hwnd);
     if (preview && preview->renderer) {
         int pageNo = GetScrollPos(hwnd, SB_VERT);
-        RectF page = preview->renderer->GetPageRect(pageNo);
-        if (!page.IsEmpty()) {
-            rect.Inflate(-PREVIEW_MARGIN, -PREVIEW_MARGIN);
-            float zoom = (float)std::min(rect.dx / page.dx, rect.dy / page.dy) - 0.001f;
-            Rect onScreen = RectF((float)rect.x, (float)rect.y, (float)page.dx * zoom, (float)page.dy * zoom).Round();
-            onScreen.Offset((rect.dx - onScreen.dx) / 2, (rect.dy - onScreen.dy) / 2);
-
-            RECT rcPage = ToRECT(onScreen);
-            FillRect(hdc, &rcPage, brushWhite);
-            preview->renderer->Render(hdc, onScreen, pageNo, zoom);
+        PreviewLayout lo = ComputePreviewLayout(hwnd, preview, pageNo);
+        if (!lo.visible.IsEmpty()) {
+            HdcFillRect(hdc, lo.visible, brushWhite);
+            preview->renderer->Render(hdc, lo, pageNo);
         }
+        DrawPageNumber(hwnd, hdc, rect);
     }
 
     DeleteObject(brushBg);
@@ -217,11 +490,17 @@ static LRESULT OnPaint(HWND hwnd) {
     return 0;
 }
 
-static LRESULT OnVScroll(HWND hwnd, WPARAM wp) {
-    SCROLLINFO si = {0};
+enum class PreviewPagePan {
+    Top,
+    Bottom
+};
+
+static LRESULT OnVScroll(HWND hwnd, WPARAM wp, PreviewPagePan pagePan = PreviewPagePan::Top) {
+    SCROLLINFO si{};
     si.cbSize = sizeof(si);
     si.fMask = SIF_ALL;
     GetScrollInfo(hwnd, SB_VERT, &si);
+    int oldPos = si.nPos;
 
     switch (LOWORD(wp)) {
         case SB_TOP:
@@ -249,7 +528,15 @@ static LRESULT OnVScroll(HWND hwnd, WPARAM wp) {
     si.fMask = SIF_POS;
     SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
 
-    InvalidateRect(hwnd, nullptr, TRUE);
+    if (si.nPos != oldPos) {
+        if (PdfPreview* preview = PreviewFromHwnd(hwnd)) {
+            preview->panX = 0;
+            preview->panY = pagePan == PreviewPagePan::Bottom ? INT_MIN : 0;
+            preview->panning = false;
+        }
+    }
+
+    HwndInvalidate(hwnd, false);
     UpdateWindow(hwnd);
     return 0;
 }
@@ -273,57 +560,236 @@ static LRESULT OnKeydown(HWND hwnd, WPARAM key) {
     }
 }
 
+static bool PreviewTryPan(HWND hwnd, PdfPreview* preview, int dx, int dy) {
+    if (!preview) {
+        return false;
+    }
+    int pageNo = GetScrollPos(hwnd, SB_VERT);
+    PreviewLayout lo = ComputePreviewLayout(hwnd, preview, pageNo);
+    if (!lo.canPanX && !lo.canPanY) {
+        return false;
+    }
+    int oldX = preview->panX;
+    int oldY = preview->panY;
+    if (lo.canPanX) {
+        preview->panX += dx;
+    }
+    if (lo.canPanY) {
+        preview->panY += dy;
+    }
+    ComputePreviewLayout(hwnd, preview, pageNo);
+    if (preview->panX == oldX && preview->panY == oldY) {
+        return false;
+    }
+    HwndInvalidate(hwnd, false);
+    return true;
+}
+
+static void PreviewZoomAt(HWND hwnd, PdfPreview* preview, Point focus, int wheelDelta) {
+    if (!preview) {
+        return;
+    }
+    int pageNo = GetScrollPos(hwnd, SB_VERT);
+    PreviewLayout lo = ComputePreviewLayout(hwnd, preview, pageNo);
+    if (lo.zoom <= 0 || lo.page.IsEmpty()) {
+        return;
+    }
+    float notches = (float)wheelDelta / (float)WHEEL_DELTA;
+    float newZoom = lo.zoom * powf(kPreviewZoomStep, notches);
+    float zoomMax = std::max(kPreviewZoomMax, lo.fitZoom * 4.f);
+    newZoom = limitValue(newZoom, kPreviewZoomMin, zoomMax);
+    if (newZoom <= lo.fitZoom) {
+        if (preview->userZoom == 0) {
+            return;
+        }
+        ResetPreviewView(preview);
+        HwndInvalidate(hwnd, false);
+        return;
+    }
+    if (SameZoom(newZoom, lo.zoom) && preview->userZoom > 0) {
+        return;
+    }
+    if (!lo.onScreen.Contains(focus)) {
+        focus = Point(lo.onScreen.x + (lo.onScreen.dx / 2), lo.onScreen.y + (lo.onScreen.dy / 2));
+    }
+    float pageX = (float)(focus.x - lo.onScreen.x) / lo.zoom;
+    float pageY = (float)(focus.y - lo.onScreen.y) / lo.zoom;
+    preview->userZoom = newZoom;
+    Rect newPx = RectF(0, 0, lo.page.dx * newZoom, lo.page.dy * newZoom).Round();
+    if (newPx.dx > lo.content.dx) {
+        preview->panX = focus.x - lo.content.x - (int)floorf((pageX * newZoom) + 0.5f);
+    } else {
+        preview->panX = 0;
+    }
+    if (newPx.dy > lo.content.dy) {
+        preview->panY = focus.y - lo.content.y - (int)floorf((pageY * newZoom) + 0.5f);
+    } else {
+        preview->panY = 0;
+    }
+    ComputePreviewLayout(hwnd, preview, pageNo);
+    HwndInvalidate(hwnd, false);
+}
+
+static void PreviewStartPan(HWND hwnd, PdfPreview* preview, Point pt) {
+    if (!preview) {
+        return;
+    }
+    int pageNo = GetScrollPos(hwnd, SB_VERT);
+    PreviewLayout lo = ComputePreviewLayout(hwnd, preview, pageNo);
+    if (!lo.canPanX && !lo.canPanY) {
+        return;
+    }
+    preview->panning = true;
+    preview->panLast = pt;
+    SetCapture(hwnd);
+    SetCursorCached(IDC_SIZEALL);
+}
+
+static void PreviewEndPan(HWND hwnd, PdfPreview* preview) {
+    if (!preview || !preview->panning) {
+        return;
+    }
+    preview->panning = false;
+    if (GetCapture() == hwnd) {
+        ReleaseCapture();
+    }
+}
+
+static LRESULT OnMouseWheel(HWND hwnd, WPARAM wp, LPARAM lp, bool horizontal) {
+    PdfPreview* preview = PreviewFromHwnd(hwnd);
+    short delta = GET_WHEEL_DELTA_WPARAM(wp);
+    bool isCtrl = (LOWORD(wp) & MK_CONTROL) || IsCtrlPressed();
+    bool isShift = (LOWORD(wp) & MK_SHIFT) || IsShiftPressed();
+    if (!horizontal && isCtrl) {
+        Point pt = HwndScreenToClient(hwnd, Point(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)));
+        PreviewZoomAt(hwnd, preview, pt, delta);
+        return 0;
+    }
+    int pageNo = GetScrollPos(hwnd, SB_VERT);
+    PreviewLayout lo = ComputePreviewLayout(hwnd, preview, pageNo);
+    int step = std::max(40, lo.content.dy / 8);
+    int dist = MulDiv((int)delta, step, WHEEL_DELTA);
+    if (horizontal || isShift) {
+        PreviewTryPan(hwnd, preview, horizontal ? -dist : dist, 0);
+        return 0;
+    }
+    if (lo.canPanY) {
+        if (PreviewTryPan(hwnd, preview, 0, dist)) {
+            return 0;
+        }
+        if (dist == 0) {
+            return 0;
+        }
+        return OnVScroll(hwnd, dist > 0 ? SB_LINEUP : SB_LINEDOWN,
+                         dist > 0 ? PreviewPagePan::Bottom : PreviewPagePan::Top);
+    }
+    return OnVScroll(hwnd, delta > 0 ? SB_LINEUP : SB_LINEDOWN);
+}
+
 static LRESULT OnDestroy(HWND hwnd) {
-    PreviewBase* preview = (PreviewBase*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    PdfPreview* preview = PreviewFromHwnd(hwnd);
     if (preview) {
         delete preview->renderer;
         preview->renderer = nullptr;
+        preview->panning = false;
     }
     return 0;
 }
 
+static const WCHAR* kPreviewWndClass = L"SumatraPDF_PreviewPane";
+
 static LRESULT CALLBACK PreviewWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    PdfPreview* preview = PreviewFromHwnd(hwnd);
     switch (msg) {
         case WM_PAINT:
             return OnPaint(hwnd);
+        case WM_ERASEBKGND:
+            return 1;
         case WM_VSCROLL:
             return OnVScroll(hwnd, wp);
         case WM_KEYDOWN:
             return OnKeydown(hwnd, wp);
         case WM_LBUTTONDOWN:
-            SetFocus(hwnd);
+        case WM_MBUTTONDOWN:
+            HwndSetFocus(hwnd);
+            PreviewStartPan(hwnd, preview, Point(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)));
             return 0;
+        case WM_LBUTTONUP:
+        case WM_MBUTTONUP:
+            PreviewEndPan(hwnd, preview);
+            return 0;
+        case WM_LBUTTONDBLCLK:
+            PreviewEndPan(hwnd, preview);
+            if (preview && preview->userZoom > 0) {
+                ResetPreviewView(preview);
+                HwndInvalidate(hwnd, false);
+            }
+            return 0;
+        case WM_MOUSEMOVE:
+            if (preview && preview->panning) {
+                Point pt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+                int dx = pt.x - preview->panLast.x;
+                int dy = pt.y - preview->panLast.y;
+                preview->panLast = pt;
+                PreviewTryPan(hwnd, preview, dx, dy);
+            }
+            return 0;
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            if (preview) {
+                preview->panning = false;
+            }
+            return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(lp) == HTCLIENT && preview && (preview->panning || preview->userZoom > 0)) {
+                SetCursorCached(IDC_SIZEALL);
+                return TRUE;
+            }
+            break;
         case WM_MOUSEWHEEL:
-            return OnVScroll(hwnd, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? SB_LINEUP : SB_LINEDOWN);
+            return OnMouseWheel(hwnd, wp, lp, false);
+        case WM_MOUSEHWHEEL:
+            return OnMouseWheel(hwnd, wp, lp, true);
         case WM_DESTROY:
             return OnDestroy(hwnd);
-        case UWM_PAINT_AGAIN:
-            InvalidateRect(hwnd, nullptr, TRUE);
+        case kUwmPaintAgain:
+            HwndInvalidate(hwnd, false);
             UpdateWindow(hwnd);
             return 0;
         default:
-            return DefWindowProc(hwnd, msg, wp, lp);
+            break;
     }
+    return DefWindowProc(hwnd, msg, wp, lp);
 }
 
-IFACEMETHODIMP PreviewBase::DoPreview() {
-    dbglog("PdfPreview: PreviewBase::DoPreview()\n");
+void UnregisterPreviewWndClass() {
+    UnregisterClassW(kPreviewWndClass, GetInstance());
+}
 
-    WNDCLASSEX wcex = {0};
+IFACEMETHODIMP PdfPreview::DoPreview() {
+    log(StrL("PdfPreview::DoPreview()\n"));
+
+    WNDCLASSEX wcex{};
     wcex.cbSize = sizeof(wcex);
     wcex.lpfnWndProc = PreviewWndProc;
-    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcex.lpszClassName = L"SumatraPDF_PreviewPane";
-    wcex.style = CS_HREDRAW | CS_VREDRAW;
-    RegisterClassEx(&wcex);
+    wcex.hCursor = GetCachedCursor(IDC_ARROW);
+    wcex.lpszClassName = kPreviewWndClass;
+    wcex.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    // owned by this DLL so it can be unregistered when the DLL unloads; a
+    // class left behind would point a reloaded DLL's windows at a stale proc
+    wcex.hInstance = GetInstance();
+    if (!RegisterClassEx(&wcex) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
 
-    m_hwnd = CreateWindow(wcex.lpszClassName, nullptr, WS_CHILD | WS_VSCROLL | WS_VISIBLE, m_rcParent.x, m_rcParent.x,
-                          m_rcParent.dx, m_rcParent.dy, m_hwndParent, nullptr, nullptr, nullptr);
+    m_hwnd = CreateWindow(wcex.lpszClassName, nullptr, WS_CHILD | WS_VSCROLL | WS_VISIBLE, m_rcParent.x, m_rcParent.y,
+                          m_rcParent.dx, m_rcParent.dy, m_hwndParent, nullptr, GetInstance(), nullptr);
     if (!m_hwnd) {
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
     this->renderer = nullptr;
+    ResetPreviewView(this);
     SetWindowLongPtr(m_hwnd, GWLP_USERDATA, (LONG_PTR)this);
 
     EngineBase* engine = GetEngine();
@@ -335,7 +801,7 @@ IFACEMETHODIMP PreviewBase::DoPreview() {
         engine = nullptr;
     }
 
-    SCROLLINFO si = {0};
+    SCROLLINFO si{};
     si.cbSize = sizeof(si);
     si.fMask = SIF_ALL;
     si.nPos = 1;
@@ -348,64 +814,117 @@ IFACEMETHODIMP PreviewBase::DoPreview() {
     return S_OK;
 }
 
-EngineBase* CPdfPreview::LoadEngine(IStream* stream) {
-    dbglog("PdfPreview: CPdfPreview::LoadEngine()\n");
-    return CreateEnginePdfFromStream(stream);
+static bool NeedsGdiPlus(PreviewType type) {
+    return type == PreviewType::DjVu || type == PreviewType::Epub || type == PreviewType::Fb2 ||
+           type == PreviewType::Mobi || type == PreviewType::Cbx || type == PreviewType::Tga;
 }
 
-EngineBase* CXpsPreview::LoadEngine(IStream* stream) {
-    return CreateXpsEngineFromStream(stream);
+PdfPreview::PdfPreview(AtomicInt* plRefCount, PreviewType type) {
+    m_type = type;
+    m_plModuleRef = plRefCount;
+    AtomicIntInc(m_plModuleRef);
+    if (NeedsGdiPlus(type)) {
+        m_gdiScope = new AutoGdiPlusShutdown();
+    }
 }
 
-#include "EngineDjVu.h"
-
-EngineBase* CDjVuPreview::LoadEngine(IStream* stream) {
-    return CreateDjVuEngineFromStream(stream);
+PdfPreview::~PdfPreview() {
+    Unload();
+    if (m_gdiScope) {
+        // the cached gdiplus objects text measuring keeps around must go before
+        // gdiplus itself does
+        PlatformFontDestroy();
+        delete m_gdiScope;
+    }
+    InterlockedDecrement(m_plModuleRef);
 }
 
-CEpubPreview::CEpubPreview(long* plRefCount) : PreviewBase(plRefCount, SZ_EPUB_PREVIEW_CLSID) {
-    m_gdiScope = new ScopedGdiPlus();
-    mui::Initialize();
+// If data is a zip (fb2z/fbz/fb2.zip), return owned bytes of the .fb2 member.
+// Otherwise return empty (caller uses original data).
+static Str ExtractFb2FromZipData(Str data) {
+    if (len(data) < 4 || data.s[0] != 'P' || data.s[1] != 'K') {
+        return {};
+    }
+    Archive* archive = OpenArchiveFromData(data);
+    if (!archive) {
+        return {};
+    }
+    AutoDelete delArchive(archive);
+    const auto& files = archive->GetFileInfos();
+    int fb2Id = -1;
+    for (auto* fi : files) {
+        if (str::EndsWithI(fi->name, StrL(".fb2"))) {
+            if (fb2Id >= 0) {
+                return {}; // more than one .fb2
+            }
+            fb2Id = fi->fileId;
+        } else if (!str::EndsWithI(fi->name, StrL(".url"))) {
+            // same restrictiveness as Fb2Doc archive load
+            return {};
+        }
+    }
+    if (fb2Id < 0 && len(files) == 1) {
+        fb2Id = 0;
+    }
+    if (fb2Id < 0) {
+        return {};
+    }
+    auto* fi = archive->GetFileDataById(fb2Id);
+    if (!fi || !fi->data) {
+        return {};
+    }
+    // take ownership of the decompressed bytes
+    Str res = Str(fi->data, fi->fileSizeUncompressed);
+    fi->data = nullptr;
+    return res;
 }
 
-CEpubPreview::~CEpubPreview() {
-    mui::Destroy();
+// Prefer mupdf for FB2 (same engine as the main viewer). The legacy
+// CreateEngineFb2FromData path fails on some plain FB2 files that mupdf
+// opens fine (issue #1677 sample set). Zip containers are unwrapped first.
+static EngineBase* CreateFb2PreviewEngine(Str data) {
+    Str extracted = ExtractFb2FromZipData(data);
+    Str plain = extracted ? extracted : data;
+    EngineBase* engine = CreateEngineMupdfFromData(plain, StrL("document.fb2"), nullptr);
+    str::Free(extracted);
+    if (engine) {
+        return engine;
+    }
+    // fall back to the old formatter engine
+    return CreateEngineFb2FromData(data);
 }
 
-EngineBase* CEpubPreview::LoadEngine(IStream* stream) {
-    return CreateEpubEngineFromStream(stream);
-}
-
-CFb2Preview::CFb2Preview(long* plRefCount) : PreviewBase(plRefCount, SZ_FB2_PREVIEW_CLSID) {
-    m_gdiScope = new ScopedGdiPlus();
-    mui::Initialize();
-}
-
-CFb2Preview::~CFb2Preview() {
-    mui::Destroy();
-}
-
-EngineBase* CFb2Preview::LoadEngine(IStream* stream) {
-    return CreateFb2EngineFromStream(stream);
-}
-
-CMobiPreview::CMobiPreview(long* plRefCount) : PreviewBase(plRefCount, SZ_MOBI_PREVIEW_CLSID) {
-    m_gdiScope = new ScopedGdiPlus();
-    mui::Initialize();
-}
-
-CMobiPreview::~CMobiPreview() {
-    mui::Destroy();
-}
-
-EngineBase* CMobiPreview::LoadEngine(IStream* stream) {
-    return CreateMobiEngineFromStream(stream);
-}
-
-EngineBase* CCbxPreview::LoadEngine(IStream* stream) {
-    return CreateCbxEngineFromStream(stream);
-}
-
-EngineBase* CTgaPreview::LoadEngine(IStream* stream) {
-    return CreateImageEngineFromStream(stream);
+// data stays owned by the caller: every engine below copies what it needs
+EngineBase* PdfPreview::LoadEngine(const Str& data) {
+    if (str::IsNull(data)) {
+        return nullptr;
+    }
+    switch (m_type) {
+        case PreviewType::Pdf:
+            return CreateEngineMupdfFromData(data, StrL("foo.pdf"), nullptr);
+        case PreviewType::Xps:
+            return CreateEngineMupdfFromData(data, StrL("foo.xps"), nullptr);
+        case PreviewType::DjVu:
+            return CreateEngineDjvuDecFromData(data);
+        case PreviewType::Epub:
+            return CreateEngineEpubFromData(data);
+        case PreviewType::Fb2:
+            return CreateFb2PreviewEngine(data);
+        case PreviewType::Mobi: {
+            Str pdf = ExtractPdfFromPrintReplicaData(data);
+            if (len(pdf) > 0) {
+                EngineBase* engine = CreateEngineMupdfFromData(pdf, StrL("file.pdf"), nullptr);
+                str::Free(pdf);
+                return engine;
+            }
+            return CreateEngineMobiFromData(data);
+        }
+        case PreviewType::Cbx:
+            return CreateEngineCbxFromData(data);
+        case PreviewType::Tga:
+            return CreateEngineImageFromData(data);
+        case PreviewType::Ofd:
+            return CreateEngineMupdfFromData(data, StrL("foo.ofd"), nullptr);
+    }
+    return nullptr;
 }

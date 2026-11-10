@@ -1,41 +1,42 @@
-/* Copyright 2021 the SumatraPDF project authors (see AUTHORS file).
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-extern bool gAddCrashMeMenu;
-
-#define SEP_ITEM "-----"
+struct AppCommandCtx;
+using BuildMenuCtx = AppCommandCtx;
 
 struct MenuDef {
-    const char* title = nullptr;
-    int id = 0;
-    int flags = 0;
+    Str title;
+    UINT_PTR idOrSubmenu = 0;
 };
 
-// value associated with menu item for owner-drawn purposes
-struct MenuOwnerDrawInfo {
-    const WCHAR* text = nullptr;
-    // copy of MENUITEMINFO fields
-    uint fType = 0;
-    uint fState = 0;
-    HBITMAP hbmpChecked = nullptr;
-    HBITMAP hbmpUnchecked = nullptr;
-    HBITMAP hbmpItem = nullptr;
+#define kMenuSeparator "-----"
+
+HMENU BuildMenuFromDef(MenuDef* menuDefs, HMENU menu, BuildMenuCtx* ctx);
+void RemoveBadMenuSeparators(HMENU menu);
+HMENU BuildMenu(MainWindow* win);
+void OnWindowContextMenu(MainWindow* win, int x, int y);
+void OnAboutContextMenu(MainWindow* win, int x, int y);
+bool CommandUsesContextMenuPoint(int cmdId);
+void ForgetFileFromFrequentlyRead(MainWindow* win, Str filePath);
+int CmdIdFromVirtualZoom(float virtualZoom);
+void UpdateAppMenu(MainWindow* win, HMENU m);
+void ToggleMenuBar(MainWindow* win, bool showTemporarily);
+float ZoomMenuItemToZoom(int menuItemId);
+
+int GetMenuBarRebarHeight(MainWindow*);
+void CreateMenuBarRebar(MainWindow*);
+void DestroyMenuBarRebar(MainWindow*);
+void ShowMenuBarRebar(MainWindow*);
+void RebuildMenuBarButtons(MainWindow*);
+bool IsShowingMenuBarRebar(MainWindow*);
+bool HandleMenuBarCommand(MainWindow*, int cmdId);
+bool ActivateMenuBarByAccel(MainWindow*, WCHAR accel);
+void UpdateCustomMenuBarMenuSelect(MainWindow*, WPARAM, LPARAM);
+
+struct MenuAccelText {
+    Str display;
+    int underlineOff = -1;
+    int underlineLen = 0;
 };
 
-void FreeAllMenuDrawInfos();
-void FreeMenuOwnerDrawInfo(MenuOwnerDrawInfo*);
-void MarkMenuOwnerDraw(HMENU);
-void FreeMenuOwnerDrawInfoData(HMENU);
-void MenuOwnerDrawnMesureItem(HWND, MEASUREITEMSTRUCT*);
-void MenuOwnerDrawnDrawItem(HWND, DRAWITEMSTRUCT*);
-HFONT GetMenuFont();
-
-HMENU BuildMenuFromMenuDef(MenuDef menuDefs[], HMENU menu, int flagFilter = 0);
-HMENU BuildMenu(WindowInfo* win);
-void OnWindowContextMenu(WindowInfo* win, int x, int y);
-void OnAboutContextMenu(WindowInfo* win, int x, int y);
-void OnMenuZoom(WindowInfo* win, int menuId);
-void OnMenuCustomZoom(WindowInfo* win);
-int MenuIdFromVirtualZoom(float virtualZoom);
-void UpdateAppMenu(WindowInfo* win, HMENU m);
-void ShowHideMenuBar(WindowInfo* win, bool showTemporarily = false);
+MenuAccelText ParseMenuAccelTextTemp(Str s);

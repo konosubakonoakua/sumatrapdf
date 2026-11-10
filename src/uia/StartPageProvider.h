@@ -1,22 +1,21 @@
-/* Copyright 2021 the SumatraPDF project authors (see AUTHORS file).
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
 class SumatraUIAutomationProvider;
 class SumatraUIAutomationStartPageProvider : public IRawElementProviderFragment, public IRawElementProviderSimple {
-    LONG refCount;
+    AtomicInt refCount;
     HWND canvasHwnd;
-    SumatraUIAutomationProvider* root;
+    SumatraUIAutomationProvider* root; // not ref-counted; nulled by DetachRoot()
 
   public:
     SumatraUIAutomationStartPageProvider(HWND canvasHwnd, SumatraUIAutomationProvider* root);
+    void DetachRoot();
     ~SumatraUIAutomationStartPageProvider();
 
-    // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(const IID&, void**);
     ULONG STDMETHODCALLTYPE AddRef();
     ULONG STDMETHODCALLTYPE Release();
 
-    // IRawElementProviderFragment
     HRESULT STDMETHODCALLTYPE Navigate(enum NavigateDirection direction, IRawElementProviderFragment** pRetVal);
     HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY** pRetVal);
     HRESULT STDMETHODCALLTYPE GetEmbeddedFragmentRoots(SAFEARRAY** pRetVal);
@@ -24,7 +23,6 @@ class SumatraUIAutomationStartPageProvider : public IRawElementProviderFragment,
     HRESULT STDMETHODCALLTYPE get_BoundingRectangle(struct UiaRect* pRetVal);
     HRESULT STDMETHODCALLTYPE get_FragmentRoot(IRawElementProviderFragmentRoot** pRetVal);
 
-    // IRawElementProviderSimple
     HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID patternId, IUnknown** pRetVal);
     HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID propertyId, VARIANT* pRetVal);
     HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple** pRetVal);

@@ -1,14 +1,14 @@
-/* Copyright 2021 the SumatraPDF project authors (see AUTHORS file).
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-#include "utils/BaseUtil.h"
-#include "utils/WinDynCalls.h"
-#include "utils/DbgHelpDyn.h"
-#include "utils/WinUtil.h"
-#include "uia/Provider.h"
+#include "base/Base.h"
+#include "base/WinDynCalls.h"
+#include "base/Win.h"
 #include "uia/Constants.h"
+#include "uia/Common.h"
 #include "uia/DocumentProvider.h"
 #include "uia/StartPageProvider.h"
+#include "uia/Provider.h"
 
 SumatraUIAutomationProvider::SumatraUIAutomationProvider(HWND hwnd)
     : refCount(1), canvasHwnd(hwnd), startpage(nullptr), document(nullptr) {
@@ -22,12 +22,15 @@ SumatraUIAutomationProvider::~SumatraUIAutomationProvider() {
         document = nullptr;
     }
 
+    startpage->DetachRoot();
     startpage->Release();
     startpage = nullptr;
 }
 
 void SumatraUIAutomationProvider::OnDocumentLoad(DisplayModel* dm) {
-    CrashIf(document);
+    // Tab switches and reloads can load while a previous document is still
+    // attached; drop it first so we never hold a stale DisplayModel*.
+    OnDocumentUnload();
 
     document = new SumatraUIAutomationDocumentProvider(canvasHwnd, this);
     document->LoadDocument(dm);
@@ -36,8 +39,12 @@ void SumatraUIAutomationProvider::OnDocumentLoad(DisplayModel* dm) {
 
 void SumatraUIAutomationProvider::OnDocumentUnload() {
     if (document) {
-        document->FreeDocument(); // tell that the dm is now invalid
-        document->Release();      // release our hooks
+        // Invalidate dm pointers before clients call back into text ranges /
+        // pages that still hold COM refs to the document provider.
+        document->FreeDocument();
+        // Drop our ownership; UIA clients that still hold refs get
+        // UIA_E_ELEMENTNOTAVAILABLE from methods that check released.
+        document->Release();
         document = nullptr;
         UiaRaiseStructureChangedEvent(this, StructureChangeType_ChildrenInvalidated, nullptr, 0);
     }
@@ -53,24 +60,19 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::QueryInterface(REFIID rii
     static const QITAB qit[] = {QITABENT(SumatraUIAutomationProvider, IRawElementProviderSimple),
                                 QITABENT(SumatraUIAutomationProvider, IRawElementProviderFragment),
                                 QITABENT(SumatraUIAutomationProvider, IRawElementProviderFragmentRoot),
-                                {0}};
+                                {nullptr}};
     return QISearch(this, qit, riid, ppv);
 }
 
 ULONG STDMETHODCALLTYPE SumatraUIAutomationProvider::AddRef() {
-    return InterlockedIncrement(&refCount);
+    return AtomicIntInc(&refCount);
 }
 
 ULONG STDMETHODCALLTYPE SumatraUIAutomationProvider::Release() {
-    LONG res = InterlockedDecrement(&refCount);
-    CrashIf(res < 0);
-    if (0 == res) {
-        delete this;
-    }
-    return res;
+    return ComRelease(&refCount, [this] { delete this; });
 }
 
-HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::GetPatternProvider([[maybe_unused]] PATTERNID patternId,
+HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::GetPatternProvider(__unused PATTERNID patternId,
                                                                           IUnknown** pRetVal) {
     *pRetVal = nullptr;
     return S_OK;
@@ -86,8 +88,9 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::GetPropertyValue(PROPERTY
         pRetVal->bstrVal = SysAllocString(L"Canvas");
         return S_OK;
     } else if (propertyId == UIA_IsKeyboardFocusablePropertyId) {
+        // VARIANT_TRUE (-1), not TRUE (1) - see DocumentProvider::GetPropertyValue
         pRetVal->vt = VT_BOOL;
-        pRetVal->boolVal = TRUE;
+        pRetVal->boolVal = VARIANT_TRUE;
         return S_OK;
     } else if (propertyId == UIA_ControlTypePropertyId) {
         pRetVal->vt = VT_I4;
@@ -95,7 +98,7 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::GetPropertyValue(PROPERTY
         return S_OK;
     } else if (propertyId == UIA_NativeWindowHandlePropertyId) {
         pRetVal->vt = VT_I4;
-        pRetVal->lVal = (LONG)canvasHwnd;
+        pRetVal->lVal = HandleToLong(canvasHwnd);
         return S_OK;
     }
 
@@ -108,11 +111,7 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::get_HostRawElementProvide
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::get_ProviderOptions(ProviderOptions* pRetVal) {
-    if (pRetVal == nullptr) {
-        return E_POINTER;
-    }
-    *pRetVal = ProviderOptions_ServerSideProvider;
-    return S_OK;
+    return UiaProviderOptions(pRetVal);
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::Navigate(enum NavigateDirection direction,
@@ -144,23 +143,11 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::Navigate(enum NavigateDir
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::GetRuntimeId(SAFEARRAY** pRetVal) {
-    if (pRetVal == nullptr) {
-        return E_POINTER;
-    }
-
-    // top-level elements should return nullptr
-    *pRetVal = nullptr;
-    return S_OK;
+    return UiaReturnNull(pRetVal);
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::GetEmbeddedFragmentRoots(SAFEARRAY** pRetVal) {
-    if (pRetVal == nullptr) {
-        return E_POINTER;
-    }
-
-    // no other roots => return nullptr
-    *pRetVal = nullptr;
-    return S_OK;
+    return UiaReturnNull(pRetVal);
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::SetFocus() {
@@ -173,13 +160,12 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationProvider::get_BoundingRectangle(str
     }
 
     // return Bounding Rect of the Canvas area
-    RECT canvas_rect;
-    GetWindowRect(canvasHwnd, &canvas_rect);
+    Rect canvasRect = HwndWindowRect(canvasHwnd);
 
-    pRetVal->left = canvas_rect.left;
-    pRetVal->top = canvas_rect.top;
-    pRetVal->width = canvas_rect.right - canvas_rect.left;
-    pRetVal->height = canvas_rect.bottom - canvas_rect.top;
+    pRetVal->left = canvasRect.x;
+    pRetVal->top = canvasRect.y;
+    pRetVal->width = canvasRect.dx;
+    pRetVal->height = canvasRect.dy;
 
     return S_OK;
 }

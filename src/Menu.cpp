@@ -1,1386 +1,2035 @@
-/* Copyright 2021 the SumatraPDF project authors (see AUTHORS file).
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-#include "utils/BaseUtil.h"
-#include "utils/ScopedWin.h"
-#include "utils/CmdLineParser.h"
-#include "utils/FileUtil.h"
-#include "utils/HtmlParserLookup.h"
-#include "utils/BitManip.h"
-#include "utils/Dpi.h"
-#include "utils/GdiPlusUtil.h"
-#include "mui/Mui.h"
-#include "utils/WinUtil.h"
+#include "base/Base.h"
+#include "base/AutoWin.h"
+#include "base/CmdLineArgs.h"
+#include "base/File.h"
+#include "gui/Dpi.h"
+#include "base/Win.h"
+#include "base/Pixmap.h"
+#include "base/GdiPlusUtil.h"
 
-#include "wingui/TreeModel.h"
+#include "gui/UIModels.h"
+#include "gui/Layout.h"
+#include "gui/Gfx.h"
+#include "gui/PlatformFont.h"
+#include "gui/VirtCtrl.h"
 
-#include "Annotation.h"
-#include "EngineBase.h"
-#include "EngineCreate.h"
-#include "EnginePdf.h"
-
+#include "Settings.h"
+#include "AppSettings.h"
 #include "DisplayMode.h"
-#include "SettingsStructs.h"
-#include "Controller.h"
+#include "DocController.h"
+#include "EngineBase.h"
+#include "base/GuessFileType.h"
+#include "EngineAll.h"
 #include "DisplayModel.h"
 #include "FileHistory.h"
 #include "Theme.h"
-#include "GlobalPrefs.h"
-#include "AppColors.h"
-#include "ProgressUpdateUI.h"
-#include "Notifications.h"
+#include "Annotation.h"
+#include "AnnotTextPopup.h"
 #include "SumatraConfig.h"
 #include "SumatraPDF.h"
-#include "WindowInfo.h"
-#include "TabInfo.h"
-#include "resource.h"
+#include "Canvas.h"
+#include "MainWindow.h"
+#include "AIChatTypes.h"
+#include "WindowTab.h"
 #include "Commands.h"
 #include "ExternalViewers.h"
 #include "Favorites.h"
 #include "FileThumbnails.h"
-#include "Menu.h"
-#include "Selection.h"
-#include "SumatraAbout.h"
-#include "SumatraDialogs.h"
+#include "HomePage.h"
 #include "Translations.h"
-#include "TocEditor.h"
-#include "EditAnnotations.h"
+#include "Toolbar.h"
+#include "PagePosition.h"
+#include "resource.h"
+#include "DarkMode.h"
+#include "Tabs.h"
+#include "Accelerators.h"
+#include "ImageSaveCropResize.h"
+#include "GoogleLens.h"
+#include "CommandAvailability.h"
+#include "ReadAloud.h"
+#include "ReadingAutoScroll.h"
+#include "ReadingBar.h"
+#include "TableOfContents.h"
+#include "SidebarPanel.h"
+#include "Menu.h"
+#include "MenuCommon.h"
+#include "MenuDefs.h"
 
-// SumatraPDF.cpp
-extern bool MakeAnnotationFromSelection(TabInfo* tab, AnnotationType annotType);
-
-// note: IDM_VIEW_SINGLE_PAGE - IDM_VIEW_CONTINUOUS and also
-//       CmdZoomFIT_PAGE - CmdZoomCUSTOM must be in a continuous range!
-static_assert(CmdViewLayoutLast - CmdViewLayoutFirst == 4, "view layout ids are not in a continuous range");
-static_assert(CmdZoomLast - CmdZoomFirst == 17, "zoom ids are not in a continuous range");
-
-bool gAddCrashMeMenu = false;
-
-void MenuUpdateDisplayMode(WindowInfo* win) {
-    bool enabled = win->IsDocLoaded();
-    DisplayMode displayMode = gGlobalPrefs->defaultDisplayModeEnum;
-    if (enabled) {
-        displayMode = win->ctrl->GetDisplayMode();
-    }
-
-    for (int id = CmdViewLayoutFirst; id <= CmdViewLayoutLast; id++) {
-        win::menu::SetEnabled(win->menu, id, enabled);
-    }
-
-    int id = 0;
-    if (IsSingle(displayMode)) {
-        id = CmdViewSinglePage;
-    } else if (IsFacing(displayMode)) {
-        id = CmdViewFacing;
-    } else if (IsBookView(displayMode)) {
-        id = CmdViewBook;
-    } else {
-        CrashIf(win->ctrl || DisplayMode::Automatic != displayMode);
-    }
-
-    CheckMenuRadioItem(win->menu, CmdViewLayoutFirst, CmdViewLayoutLast, id, MF_BYCOMMAND);
-    win::menu::SetChecked(win->menu, CmdViewContinuous, IsContinuous(displayMode));
-
-    if (win->currentTab && win->currentTab->GetEngineType() == kindEngineComicBooks) {
-        bool mangaMode = win->AsFixed()->GetDisplayR2L();
-        win::menu::SetChecked(win->menu, CmdViewMangaMode, mangaMode);
-    }
-}
+static bool gAddCrashMeMenu = false;
 
 // clang-format off
-//[ ACCESSKEY_GROUP File Menu
-static MenuDef menuDefFile[] = {
-    { _TRN("New &window\tCtrl+N"),          CmdNewWindow,              MF_REQ_DISK_ACCESS },
-    { _TRN("&Open...\tCtrl+O"),             CmdOpen,                   MF_REQ_DISK_ACCESS },
-    { "Open Folder",                        CmdOpenFolder,             MF_REQ_DISK_ACCESS | MF_RAMICRO_ONLY },
-    { _TRN("&Close\tCtrl+W"),               CmdClose,                  MF_REQ_DISK_ACCESS },
-    { _TRN("Show in &folder"),              CmdShowInFolder,           MF_REQ_DISK_ACCESS },
-    { _TRN("&Save As...\tCtrl+S"),          CmdSaveAs,                 MF_REQ_DISK_ACCESS },
-    { _TRN("Save Annotations"),             CmdSaveAnnotations,        MF_REQ_DISK_ACCESS },
- //[ ACCESSKEY_ALTERNATIVE // only one of these two will be shown
-#ifdef ENABLE_SAVE_SHORTCUT
-    { _TRN("Save S&hortcut...\tCtrl+Shift+S"), Cmd::SaveAsBookmark,    MF_REQ_DISK_ACCESS | MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
-//| ACCESSKEY_ALTERNATIVE
-#else
-    { _TRN("Re&name...\tF2"),               CmdRenameFile,             MF_REQ_DISK_ACCESS },
-#endif
-//] ACCESSKEY_ALTERNATIVE
-    { _TRN("&Print...\tCtrl+P"),            CmdPrint,                  MF_REQ_PRINTER_ACCESS | MF_NOT_FOR_EBOOK_UI },
-    { SEP_ITEM,                             0,                         MF_REQ_DISK_ACCESS },
-//[ ACCESSKEY_ALTERNATIVE // PDF/XPS/CHM specific items are dynamically removed in RebuildFileMenu
-    { _TRN("Open in &Adobe Reader"),        CmdOpenWithAcrobat,        MF_REQ_DISK_ACCESS | MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Open in &Foxit Reader"),        CmdOpenWithFoxIt,          MF_REQ_DISK_ACCESS | MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Open &in PDF-XChange"),         CmdOpenWithPdfXchange,     MF_REQ_DISK_ACCESS | MF_NOT_FOR_EBOOK_UI },
-//| ACCESSKEY_ALTERNATIVE
-    { _TRN("Open in &Microsoft XPS-Viewer"),CmdOpenWithXpsViewer,      MF_REQ_DISK_ACCESS | MF_NOT_FOR_EBOOK_UI },
-//| ACCESSKEY_ALTERNATIVE
-    { _TRN("Open in &Microsoft HTML Help"), CmdOpenWithHtmlHelp,       MF_REQ_DISK_ACCESS | MF_NOT_FOR_EBOOK_UI },
-//] ACCESSKEY_ALTERNATIVE
-    // further entries are added if specified in gGlobalPrefs.vecCommandLine
-    { _TRN("Send by &E-mail..."),           CmdSendByEmail,            MF_REQ_DISK_ACCESS },
-    { SEP_ITEM,                             0,                         MF_REQ_DISK_ACCESS },
-    { _TRN("P&roperties\tCtrl+D"),          CmdProperties,             0 },
-    { SEP_ITEM,                             0,                         0 },
-    { _TRN("E&xit\tCtrl+Q"),                CmdExit,                   0 },
-    { 0, 0, 0 },
+static MenuDef menuDefZoomShort[] = {
+    {
+        TrN("Fit &Page"),
+        CmdZoomFitPage,
+    },
+    {
+        TrN("&Actual Size"),
+        CmdZoomActualSize,
+    },
+    {
+        TrN("Fit &Width"),
+        CmdZoomFitWidth,
+    },
+    {
+        TrN("Fit &Height"),
+        CmdZoomFitHeight,
+    },
+    {
+        TrN("Fit by &Orientation"),
+        CmdZoomFitByOrientation,
+    },
+    {
+        TrN("Fit &Content"),
+        CmdZoomFitContent,
+    },
+    {
+        TrN("Fit &Visible"),
+        CmdZoomFitVisible,
+    },
+    {
+        TrN("&Shrink To Fit"),
+        CmdZoomShrinkToFit,
+    },
+    {
+        TrN("Custom &Zoom..."),
+        CmdZoomCustom,
+    },
+    {
+        TrN("&To Selection"),
+        CmdZoomToSelection,
+    },
+    {
+        StrL(kMenuSeparator),
+        0,
+    },
+    {
+        {},
+        0,
+    },
 };
-//] ACCESSKEY_GROUP File Menu
 
-//[ ACCESSKEY_GROUP View Menu
-static MenuDef menuDefView[] = {
-    { _TRN("&Single Page\tCtrl+6"),         CmdViewSinglePage,        MF_NOT_FOR_CHM },
-    { _TRN("&Facing\tCtrl+7"),              CmdViewFacing,            MF_NOT_FOR_CHM },
-    { _TRN("&Book View\tCtrl+8"),           CmdViewBook,              MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Show &Pages Continuously"),     CmdViewContinuous,        MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
-    // TODO: "&Inverse Reading Direction" (since some Mangas might be read left-to-right)?
-    { _TRN("Man&ga Mode"),                  CmdViewMangaMode,         MF_CBX_ONLY },
-    { SEP_ITEM,                             0,                        MF_NOT_FOR_CHM },
-    { _TRN("Rotate &Left\tCtrl+Shift+-"),   CmdViewRotateLeft,        MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Rotate &Right\tCtrl+Shift++"),  CmdViewRotateRight,       MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
-    { SEP_ITEM,                             0,                        MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Pr&esentation\tF5"),            CmdViewPresentationMode,  MF_REQ_FULLSCREEN | MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
-    { _TRN("F&ullscreen\tF11"),             CmdViewFullScreen,        MF_REQ_FULLSCREEN },
-    { SEP_ITEM,                             0,                        MF_REQ_FULLSCREEN },
-    { _TRN("Show Book&marks\tF12"),         CmdViewBookmarks,         0 },
-    { _TRN("Show &Toolbar\tF8"),            CmdViewShowHideToolbar,   MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Show Scr&ollbars"),             CmdViewShowHideScrollbars,MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
-    { SEP_ITEM,                             0,                        MF_REQ_ALLOW_COPY | MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Select &All\tCtrl+A"),          CmdSelectAll,             MF_REQ_ALLOW_COPY | MF_NOT_FOR_EBOOK_UI },
-    { _TRN("&Copy Selection\tCtrl+C"),      CmdCopySelection,         MF_REQ_ALLOW_COPY | MF_NOT_FOR_EBOOK_UI },
-    { 0, 0, 0 },
+//[ ACCESSKEY_GROUP Context Menu (Selection)
+static MenuDef menuDefSelection[] = {
+    {
+        TrN("&Copy To Clipboard"),
+        CmdCopySelection,
+    },
+    {
+        TrN("Copy As &Image To Clipboard"),
+        CmdCopySelectionAsImage,
+    },
+    {
+        TrN("&Save As Image..."),
+        CmdSaveSelectionAsImage,
+    },
+    {
+        TrN("&Print Selection..."),
+        CmdPrintSelection,
+    },
+    {
+        TrN("Visual Search With Google &Lens"),
+        CmdSearchGoogleLens,
+    },
+    {
+        TrN("&Zoom To Selection"),
+        CmdZoomToSelection,
+    },
+    {
+        TrN("&Trim Pages To Selection"),
+        CmdTrimPagesToSelection,
+    },
+    {
+        TrN("Count &Words"),
+        CmdCountWords,
+    },
+    {
+        TrN("Show Selected Te&xt"),
+        CmdShowSelectedText,
+    },
+    {
+        StrL(kMenuSeparator),
+        kMenuSeparatorID,
+    },
+    {
+        TrN("&Translate with"),
+        (UINT_PTR)menuDefTranslateWith,
+    },
+    {
+        TrN("S&earch with"),
+        (UINT_PTR)menuDefSearchWith,
+    },
+    {
+        TrN("Select C&urrent Page"),
+        CmdSelectCurrentPage,
+    },
+    {
+        TrN("Select &All"),
+        CmdSelectAll,
+    },
+    {
+        {},
+        0,
+    },
 };
-//] ACCESSKEY_GROUP View Menu
+//] ACCESSKEY_GROUP Context Menu (Selection)
 
-//[ ACCESSKEY_GROUP GoTo Menu
-static MenuDef menuDefGoTo[] = {
-    { _TRN("&Next Page\tRight Arrow"),      CmdGoToNextPage,         0 },
-    { _TRN("&Previous Page\tLeft Arrow"),   CmdGoToPrevPage,         0 },
-    { _TRN("&First Page\tHome"),            CmdGoToFirstPage,        0 },
-    { _TRN("&Last Page\tEnd"),              CmdGoToLastPage,         0 },
-    { _TRN("Pa&ge...\tCtrl+G"),             CmdGoToPage,             0 },
-    { SEP_ITEM,                             0,                       0 },
-    { _TRN("&Back\tAlt+Left Arrow"),        CmdGoToNavBack,          0 },
-    { _TRN("F&orward\tAlt+Right Arrow"),    CmdGoToNavForward,       0 },
-    { SEP_ITEM,                             0,                       MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Fin&d...\tCtrl+F"),             CmdFindFirst,            MF_NOT_FOR_EBOOK_UI },
-    { 0, 0, 0 },
-};
-//] ACCESSKEY_GROUP GoTo Menu
-
-//[ ACCESSKEY_GROUP Zoom Menu
-// the entire menu is MF_NOT_FOR_EBOOK_UI
-static MenuDef menuDefZoom[] = {
-    { _TRN("Fit &Page\tCtrl+0"),            CmdZoomFitPage,          MF_NOT_FOR_CHM },
-    { _TRN("&Actual Size\tCtrl+1"),         CmdZoomActualSize,       MF_NOT_FOR_CHM },
-    { _TRN("Fit &Width\tCtrl+2"),           CmdZoomFitWidth,         MF_NOT_FOR_CHM },
-    { _TRN("Fit &Content\tCtrl+3"),         CmdZoomFitContent,       MF_NOT_FOR_CHM },
-    { _TRN("Custom &Zoom...\tCtrl+Y"),      CmdZoomCustom,           0 },
-    { SEP_ITEM,                             0,                       0 },
-    { "6400%",                              CmdZoom6400,             MF_NO_TRANSLATE | MF_NOT_FOR_CHM },
-    { "3200%",                              CmdZoom3200,             MF_NO_TRANSLATE | MF_NOT_FOR_CHM },
-    { "1600%",                              CmdZoom1600,             MF_NO_TRANSLATE | MF_NOT_FOR_CHM },
-    { "800%",                               CmdZoom800,              MF_NO_TRANSLATE | MF_NOT_FOR_CHM },
-    { "400%",                               CmdZoom400,              MF_NO_TRANSLATE },
-    { "200%",                               CmdZoom200,              MF_NO_TRANSLATE },
-    { "150%",                               CmdZoom150,              MF_NO_TRANSLATE },
-    { "125%",                               CmdZoom125,              MF_NO_TRANSLATE },
-    { "100%",                               CmdZoom100,              MF_NO_TRANSLATE },
-    { "50%",                                CmdZoom50,               MF_NO_TRANSLATE },
-    { "25%",                                CmdZoom25,               MF_NO_TRANSLATE },
-    { "12.5%",                              CmdZoom12_5,             MF_NO_TRANSLATE | MF_NOT_FOR_CHM },
-    { "8.33%",                              CmdZoom8_33,             MF_NO_TRANSLATE | MF_NOT_FOR_CHM },
-    { 0, 0, 0 },
-};
-//] ACCESSKEY_GROUP Zoom Menu
-
-//[ ACCESSKEY_GROUP Settings Menu
-static MenuDef menuDefSettings[] = {
-    { _TRN("Change Language"),              CmdChangeLanguage,        0 },
-#if 0
-    { _TRN("Contribute Translation"),       CmdContributeTranslation, MF_REQ_DISK_ACCESS },
-    { SEP_ITEM,                             0,                        MF_REQ_DISK_ACCESS },
-#endif
-    { _TRN("&Options..."),                  CmdOptions,               MF_REQ_PREF_ACCESS },
-    { _TRN("&Advanced Options..."),         CmdAdvancedOptions,       MF_REQ_PREF_ACCESS | MF_REQ_DISK_ACCESS },
-    { 0, 0, 0 },
-};
-//] ACCESSKEY_GROUP Settings Menu
-
-//[ ACCESSKEY_GROUP Favorites Menu
-// the entire menu is MF_NOT_FOR_EBOOK_UI
-MenuDef menuDefFavorites[] = {
-    { _TRN("Add to favorites"),             CmdFavoriteAdd,                0 },
-    { _TRN("Remove from favorites"),        CmdFavoriteDel,                0 },
-    { _TRN("Show Favorites"),               CmdFavoriteToggle,             MF_REQ_DISK_ACCESS },
-    { 0, 0, 0 },
-};
-//] ACCESSKEY_GROUP Favorites Menu
-
-//[ ACCESSKEY_GROUP Help Menu
-static MenuDef menuDefHelp[] = {
-    { _TRN("Visit &Website"),               CmdHelpVisitWebsite,          MF_REQ_DISK_ACCESS },
-    { _TRN("&Manual"),                      CmdHelpOpenManualInBrowser,   MF_REQ_DISK_ACCESS },
-    { _TRN("Check for &Updates"),           CmdCheckUpdate,               MF_REQ_INET_ACCESS },
-    { SEP_ITEM,                             0,                            MF_REQ_DISK_ACCESS },
-    { _TRN("&About"),                       CmdHelpAbout,                 0 },
-    { 0, 0, 0 },
-};
-//] ACCESSKEY_GROUP Help Menu
-
-//[ ACCESSKEY_GROUP Debug Menu
-static MenuDef menuDefDebug[] = {
-    { _TRN("&Advanced Options..."),         CmdAdvancedOptions,       MF_REQ_PREF_ACCESS | MF_REQ_DISK_ACCESS },
-    { "Highlight links",                    CmdDebugShowLinks,        MF_NO_TRANSLATE },
-    { "Toggle ebook UI",                    CmdDebugEbookUI,          MF_NO_TRANSLATE },
-    { "Mui debug paint",                    CmdDebugMui,              MF_NO_TRANSLATE },
-    { "Annotation from Selection",          CmdDebugAnnotations,      MF_NO_TRANSLATE },
-    { "Download symbols",                   CmdDebugDownloadSymbols,  MF_NO_TRANSLATE },
-    { "Test app",                           CmdDebugTestApp,          MF_NO_TRANSLATE },
-    { "Show notification",                  CmdDebugShowNotif,        MF_NO_TRANSLATE },
-    { 0, 0, 0 },
-};
-//] ACCESSKEY_GROUP Debug Menu
-
-//[ ACCESSKEY_GROUP Context Menu (Content)
-// the entire menu is MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI
+//[ ACCESSKEY_GROUP Context Menu (Main)
 static MenuDef menuDefContext[] = {
-    { _TRN("&Copy Selection"),              CmdCopySelection,         MF_REQ_ALLOW_COPY },
-    { _TRN("Copy &Link Address"),           CmdCopyLinkTarget,        MF_REQ_ALLOW_COPY },
-    { _TRN("Copy Co&mment"),                CmdCopyComment,           MF_REQ_ALLOW_COPY },
-    { _TRN("Copy &Image"),                  CmdCopyImage,             MF_REQ_ALLOW_COPY },
-    { _TRN("Select &All"),                  CmdSelectAll,             MF_REQ_ALLOW_COPY },
-    { SEP_ITEM,                             0,                        MF_REQ_ALLOW_COPY },
+    {
+        TrN("S&election"),
+        (UINT_PTR)menuDefSelection,
+    },
+    {
+        TrN("Visual Search With Google &Lens"),
+        (UINT_PTR)menuDefGoogleLens,
+    },
+    {
+        TrN("Copy Link &Address"),
+        CmdCopyLinkTarget,
+    },
+    {
+        TrN("Copy Co&mment"),
+        CmdCopyComment,
+    },
+    {
+        TrN("Sho&w Comment"),
+        CmdShowAnnotationText,
+    },
+    {
+        TrN("Save Attachment"),
+        CmdSaveAttachment,
+    },
+    {
+        TrN("Selected &Image"),
+        (UINT_PTR)menuDefContextImage,
+    },
     // note: strings cannot be "" or else items are not there
-    {"add",                                 CmdFavoriteAdd,           MF_NO_TRANSLATE   },
-    {"del",                                 CmdFavoriteDel,           MF_NO_TRANSLATE   },
-    { _TRN("Show &Favorites"),              CmdFavoriteToggle,        0                 },
-    { _TRN("Show &Bookmarks\tF12"),         CmdViewBookmarks,         0                 },
-    { _TRN("Show &Toolbar\tF8"),            CmdViewShowHideToolbar,   MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Show &Scrollbars"),             CmdViewShowHideScrollbars,MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
-    { _TRN("Save Annotations"),             CmdSaveAnnotations,       MF_REQ_DISK_ACCESS },
-#if 0
-    {"New Bookmarks",                       CmdNewBookmarks,          MF_NO_TRANSLATE },
-#endif
-    { _TRN("Edit Annotations"),             CmdEditAnnotations,       MF_REQ_DISK_ACCESS },
-    { SEP_ITEM,                             0,                        MF_PLUGIN_MODE_ONLY | MF_REQ_ALLOW_COPY },
-    { _TRN("&Save As..."),                  CmdSaveAs,                MF_PLUGIN_MODE_ONLY | MF_REQ_DISK_ACCESS },
-    { _TRN("&Print..."),                    CmdPrint,                 MF_PLUGIN_MODE_ONLY | MF_REQ_PRINTER_ACCESS },
-    { _TRN("P&roperties"),                  CmdProperties,            MF_PLUGIN_MODE_ONLY },
-    { _TRN("E&xit Fullscreen"),             CmdExitFullScreen,        0 },
-    { 0, 0, 0 },
+    {
+        StrL("Add to favorites"),
+        CmdFavoriteAdd,
+    },
+    {
+        StrL("Remove from favorites"),
+        CmdFavoriteDel,
+    },
+    {
+        TrN("Show &Favorites"),
+        CmdFavoriteToggle,
+    },
+    {
+        TrN("Show &Bookmarks"),
+        CmdToggleBookmarks,
+    },
+    {
+        TrN("Show &Thumbnails"),
+        CmdToggleThumbnails,
+    },
+    {
+        TrN("Sh&ow Toolbar"),
+        CmdToggleToolbar,
+    },
+    {
+        TrN("Show Caption"),
+        CmdToggleCaption,
+    },
+    {
+        TrN("Auto-hide Sidebar"),
+        CmdToggleSidebarAutoHide,
+    },
+    {
+        StrL(kMenuSeparator),
+        kMenuSeparatorID,
+    },
+    {
+        TrN("AI chat with document using"),
+        (UINT_PTR)menuDefDocumentAIChat,
+    },
+    {
+        TrN("Document"),
+        (UINT_PTR)menuDefDocumentOperations,
+    },
+    {
+        TrN("Read Aloud"),
+        (UINT_PTR)menuDefContextReadAloud,
+    },
+    {
+        TrN("Annotations"),
+        (UINT_PTR)menuDefContextAnnotations,
+    },
+    {
+        TrN("Show Errors"),
+        CmdShowErrors,
+    },
+    {
+        TrN("E&xit Fullscreen"),
+        CmdToggleFullscreen, // only seen in full-screen mode
+    },
+    {
+        {},
+        0,
+    },
 };
-//] ACCESSKEY_GROUP Context Menu (Content)
+//] ACCESSKEY_GROUP Context Menu (Main)
 
-//[ ACCESSKEY_GROUP Context Menu (Start)
-static MenuDef menuDefCreateAnnot[] = {
-    { _TRN("Text"), CmdCreateAnnotText, 0 },
-    { _TRN("Free Text"), CmdCreateAnnotFreeText, 0 },
-    { _TRN("Stamp"), CmdCreateAnnotStamp, 0 },
-    { _TRN("Caret"), CmdCreateAnnotCaret, 0 },
-    //{ _TRN("Ink"), CmdCreateAnnotInk, 0 },
-    //{ _TRN("Square"), CmdCreateAnnotSquare, 0 },
-    //{ _TRN("Circle"), CmdCreateAnnotCircle, 0 },
-    //{ _TRN("Line"), CmdCreateAnnotLine, 0 },
-    //{ _TRN("Polygon"), CmdCreateAnnotPolygon, 0 },
-    //{ _TRN("Poly Line"), CmdCreateAnnotPolyLine, 0 },
-    { _TRN("Highlight"), CmdCreateAnnotHighlight, 0 },
-    { _TRN("Underline"), CmdCreateAnnotUnderline, 0 },
-    { _TRN("Strike Out"), CmdCreateAnnotStrikeOut, 0 },
-    { _TRN("Squiggly"), CmdCreateAnnotSquiggly, 0 },
-    //{ _TRN("File Attachment"), CmdCreateAnnotFileAttachment, 0 },
-    //{ _TRN("Redact"), CmdCreateAnnotRedact, 0 },
-    { 0, 0, 0 },
-};
-//] ACCESSKEY_GROUP Context Menu (Start)
-
-//[ ACCESSKEY_GROUP Context Menu (Start)
-static MenuDef menuDefCreateAnnotRaMicro[] = {
-    { _TRN("Text"), CmdCreateAnnotText, 0 },
-    { _TRN("Free Text"), CmdCreateAnnotFreeText, 0 },
-    { _TRN("Highlight"), CmdCreateAnnotHighlight, 0 },
-    { 0, 0, 0 },
-};
-//] ACCESSKEY_GROUP Context Menu (Start)
-
-//[ ACCESSKEY_GROUP Context Menu (Start)
-static MenuDef menuDefContextStart[] = {
-    { _TRN("&Open Document"),               CmdOpenSelectedDocument,   MF_REQ_DISK_ACCESS },
-    { _TRN("&Pin Document"),                CmdPinSelectedDocument,    MF_REQ_DISK_ACCESS | MF_REQ_PREF_ACCESS },
-    { SEP_ITEM,                             0,                         MF_REQ_DISK_ACCESS | MF_REQ_PREF_ACCESS },
-    { _TRN("&Remove From History"),         CmdForgetSelectedDocument, MF_REQ_DISK_ACCESS | MF_REQ_PREF_ACCESS },
-    { 0, 0, 0 },
-};
-//] ACCESSKEY_GROUP Context Menu (Start)
 // clang-format on
 
-HMENU BuildMenuFromMenuDef(MenuDef menuDefs[], HMENU menu, int flagFilter) {
-    CrashIf(!menu);
-    bool wasSeparator = true;
+// clang-format off
+static int disableIfDirectoryOrBrokenPDF[] = {
+    CmdRenameFile,
+    CmdDeleteFile,
+    CmdDeleteFileAndOpenNext,
+    CmdSendByEmail,
+    CmdOpenWithAcrobat,
+    CmdOpenWithFoxit,
+    CmdOpenWithPdfXchange,
+    CmdShowInFolder, // TODO: why?
+};
 
-    int i = 0;
-    while (true) {
-        MenuDef md = menuDefs[i];
-        if (md.title == nullptr) {
-            // sentinel
-            break;
-        }
-        i++;
-        if ((md.flags & MF_PLUGIN_MODE_ONLY) != 0) {
-            if (!gPluginMode) {
-                continue;
-            }
-        }
-        if ((md.flags & MF_RAMICRO_ONLY) != 0) {
-            if (!gIsRaMicroBuild) {
-                continue;
-            }
-        }
-        if (md.flags & flagFilter) {
-            continue;
-        }
+static UINT_PTR menusNoTranslate[] = {
+    CmdZoom6400,
+    CmdZoom3200,
+    CmdZoom1600,
+    CmdZoom800,
+    CmdZoom400,
+    CmdZoom200,
+    CmdZoom150,
+    CmdZoom125,
+    CmdZoom100,
+    CmdZoom50,
+    CmdZoom25,
+    CmdZoom12_5,
+    CmdZoom8_33,
+};
+// clang-format on
 
-        if (!HasPermission(md.flags >> PERM_FLAG_OFFSET)) {
-            continue;
-        }
+#define cmdIdInList(name) CmdIdInList(cmdId, name, dimof(name))
 
-        if (str::Eq(md.title, SEP_ITEM)) {
-            // prevent two consecutive separators
-            if (!wasSeparator) {
-                AppendMenuW(menu, MF_SEPARATOR, (UINT_PTR)md.id, nullptr);
-            }
-            wasSeparator = true;
-        } else if (MF_NO_TRANSLATE == (md.flags & MF_NO_TRANSLATE)) {
-            AutoFreeWstr tmp = strconv::Utf8ToWstr(md.title);
-            AppendMenuW(menu, MF_STRING, (UINT_PTR)md.id, tmp);
-            wasSeparator = false;
-        } else {
-            const WCHAR* tmp = trans::GetTranslation(md.title);
-            AppendMenuW(menu, MF_STRING, (UINT_PTR)md.id, tmp);
-            wasSeparator = false;
-        }
-    }
-
-    // TODO: remove trailing separator if there ever is one
-    CrashIf(wasSeparator);
-    return menu;
-}
-
-static void AddFileMenuItem(HMENU menuFile, const WCHAR* filePath, int index) {
-    CrashIf(!filePath || !menuFile);
-    if (!filePath || !menuFile) {
+static void AddFileMenuItem(HMENU menuFile, const FileHistoryEntry& fe, int index) {
+    ReportIf(!menuFile);
+    if (!menuFile) {
         return;
     }
 
-    AutoFreeWstr menuString;
-    menuString.SetCopy(path::GetBaseNameNoFree(filePath));
-    auto fileName = win::menu::ToSafeString(menuString);
-    int menuIdx = (int)((index + 1) % 10);
-    menuString.Set(str::Format(L"&%d) %s", menuIdx, fileName));
-    uint menuId = CmdFileHistoryFirst + index;
+    TempStr menuString = path::GetBaseNameTemp(fe.path);
+    // shorten very long file names so that menu isn't too wide
+    const int kMaxRunes = 70;
+    menuString = ShortenStringUtf8InTheMiddleTemp(menuString, kMaxRunes);
+
+    TempStr fileName = MenuToSafeStringTemp(menuString);
+    int menuIdx = (index + 1) % 10;
+    menuString = fmt("&%d) %s", menuIdx, fileName);
     uint flags = MF_BYCOMMAND | MF_ENABLED | MF_STRING;
-    InsertMenuW(menuFile, CmdExit, flags, menuId, menuString);
+    InsertMenuW(menuFile, CmdExit, flags, (uint)fe.cmdId, CWStrTemp(menuString));
 }
 
 static void AppendRecentFilesToMenu(HMENU m) {
-    if (!HasPermission(Perm_DiskAccess)) {
+    if (!CanAccessDisk()) {
         return;
     }
 
-    int i;
-    for (i = 0; i < FILE_HISTORY_MAX_RECENT; i++) {
-        DisplayState* state = gFileHistory.Get(i);
-        if (!state || state->isMissing) {
+    Vec<FileHistoryEntry> files;
+    for (int i = 0; i < kFileHistoryMaxRecent; i++) {
+        FileState* fs = FileHistoryGet(i);
+        if (!fs || fs->isMissing) {
             break;
         }
-        AddFileMenuItem(m, state->filePath, i);
+        Str fp = fs->filePath;
+        if (len(fp) == 0) {
+            // comes from settings file so can be missing due to user modifications
+            continue;
+        }
+        VecAppend(files, FileHistoryEntry{fp, 0});
+    }
+    if (len(files) == 0) {
+        return;
     }
 
-    if (i > 0) {
-        InsertMenu(m, CmdExit, MF_BYCOMMAND | MF_SEPARATOR, 0, nullptr);
+    SetFileHistoryCmdIds(files);
+    for (int i = 0; i < len(files); i++) {
+        AddFileMenuItem(m, files[i], i);
+    }
+
+    InsertMenuW(m, CmdExit, MF_BYCOMMAND | MF_SEPARATOR, 0, nullptr);
+}
+
+static void AppendCommandsToMenu(HMENU m, const Vec<CustomCommand*>& cmds, bool isEnabled) {
+    for (CustomCommand* cmd : cmds) {
+        if (len(cmd->name) == 0) {
+            continue;
+        }
+        TempStr menuString = cmd->name;
+        int cmdId = cmd->id;
+        menuString = AppendAccelKeyToMenuStringTemp(menuString, cmdId);
+        UINT flags = MF_STRING;
+        flags |= isEnabled ? MF_ENABLED : MF_DISABLED;
+        WCHAR* ws = CWStrTemp(menuString);
+        AppendMenuW(m, flags, (UINT_PTR)cmd->id, ws);
     }
 }
 
-static void AppendExternalViewersToMenu(HMENU menuFile, const WCHAR* filePath) {
-    if (0 == gGlobalPrefs->externalViewers->size()) {
+static void AppendThemesToMenu(HMENU m) {
+    Vec<CustomCommand*> cmds;
+    GetCommandsWithOrigId(cmds, CmdSetTheme);
+    AppendCommandsToMenu(m, cmds, true);
+}
+
+static void AppendSelectionHandlersToMenu(HMENU m, bool isEnabled) {
+    Vec<CustomCommand*> cmds;
+    GetCommandsWithOrigId(cmds, CmdSelectionHandler);
+    AppendCommandsToMenu(m, cmds, isEnabled);
+}
+
+// TextSnippets: one is an item of its own, several get a submenu
+static void AppendTextSnippetsToMenu(HMENU m) {
+    Vec<CustomCommand*> cmds;
+    GetCommandsWithOrigId(cmds, CmdInsertTextSnippet);
+    if (len(cmds) < 2) {
+        AppendCommandsToMenu(m, cmds, true);
         return;
     }
-    if (!HasPermission(Perm_DiskAccess) || (filePath && !file::Exists(filePath))) {
+    HMENU sub = CreatePopupMenu();
+    AppendCommandsToMenu(sub, cmds, true);
+    AppendMenuW(m, MF_POPUP | MF_ENABLED, (UINT_PTR)sub, ToWStrTemp(Tr("Insert Te&xt")).s);
+}
+
+static void AppendExternalViewersToMenu(HMENU menuFile, Str filePath) {
+    if (!CanAccessDisk() || (filePath && !file::Exists(filePath))) {
         return;
     }
-
-    int maxEntries = CmdOpenWithExternalLast - CmdOpenWithExternalFirst + 1;
-    int count = 0;
-    for (size_t i = 0; i < gGlobalPrefs->externalViewers->size() && count < maxEntries; i++) {
-        ExternalViewer* ev = gGlobalPrefs->externalViewers->at(i);
-        if (!ev->commandLine) {
+    Vec<CustomCommand*> cmds;
+    GetCommandsWithOrigId(cmds, CmdViewWithExternalViewer);
+    for (CustomCommand* cmd : cmds) {
+        Str commandLine = GetCommandStringArg(cmd, kCmdArgCommandLine, {});
+        Str filter = GetCommandStringArg(cmd, kCmdArgFilter, {});
+        if (str::IsEmptyOrWhiteSpace(commandLine)) {
             continue;
         }
-        if (ev->filter && !str::Eq(ev->filter, L"*") && !(filePath && path::Match(filePath, ev->filter))) {
+        if (filter && !(filePath && PathMatchFilter(filePath, filter))) {
+            continue;
+        }
+        TempStr name = cmd->name;
+        if (str::IsEmptyOrWhiteSpace(cmd->name)) {
+            if (str::IsEmptyOrWhiteSpace(name)) {
+                StrNode* args = ParseCmdLine(ToWStrTemp(commandLine));
+                AutoFreeStrNode freeArgs(args);
+                StrNode* arg0 = args;
+                for (int i = 0; arg0 && i < 2; i++) {
+                    arg0 = arg0->next;
+                }
+                int nArgs = 0;
+                for (StrNode* n = arg0; n; n = n->next) {
+                    nArgs++;
+                }
+                if (nArgs <= 0) {
+                    continue;
+                }
+                name = path::GetBaseNameTemp(arg0->s);
+                int dotPos = str::IndexOfChar(name, '.');
+                if (dotPos >= 0) {
+                    name = str::DupTemp(Str(name.s, dotPos));
+                }
+            }
+        }
+        // TempStr menuString = fmt(Tr("Open in %s"), name);
+        TempStr menuString = name;
+        int cmdId = cmd->id;
+        menuString = AppendAccelKeyToMenuStringTemp(menuString, cmdId);
+        WCHAR* ws = CWStrTemp(menuString);
+        InsertMenuW(menuFile, cmdId, MF_BYCOMMAND | MF_ENABLED | MF_STRING, (UINT_PTR)cmdId, ws);
+        if (len(filePath) == 0) {
+            MenuSetEnabled(menuFile, cmdId, false);
+        }
+    }
+}
+
+// shows duplicate separator if no external viewers
+static void DynamicPartOfFileMenu(HMENU menu, BuildMenuCtx* ctx) {
+    AppendRecentFilesToMenu(menu);
+
+    // Suppress menu items that depend on specific software being installed:
+    // e-mail client, Adobe Reader, Foxit, PDF-XChange
+    // Don't hide items here that won't always be hidden
+    // (MenuUpdateStateForWindow() is for that)
+    for (int i = 0; gOpenWithKnownExternalViewerCmds[i]; i++) {
+        int cmdId = gOpenWithKnownExternalViewerCmds[i];
+        bool remove, disable;
+        GetCommandIdState(ctx, cmdId, &remove, &disable);
+        if (remove || disable) {
+            MenuRemove(menu, cmdId);
+        }
+    }
+}
+
+void RemoveBadMenuSeparators(HMENU menu) {
+    int nMenus;
+    // remove separator items at the beginning
+again1:
+    nMenus = GetMenuItemCount(menu);
+    if (nMenus == 0) {
+        return;
+    }
+    UINT id = GetMenuItemID(menu, 0);
+    if (id == kMenuSeparatorID) {
+        RemoveMenu(menu, 0, MF_BYPOSITION);
+        goto again1;
+    }
+    // remove separator items at the end
+again2:
+    nMenus = GetMenuItemCount(menu);
+    if (nMenus == 0) {
+        return;
+    }
+    id = GetMenuItemID(menu, nMenus - 1);
+    if (id == kMenuSeparatorID) {
+        RemoveMenu(menu, nMenus - 1, MF_BYPOSITION);
+        goto again2;
+    }
+    // remove 2 or more consequitive separator items
+again3:
+    nMenus = GetMenuItemCount(menu);
+    for (int i = 1; i < nMenus; i++) {
+        id = GetMenuItemID(menu, i);
+        UINT idPrev = GetMenuItemID(menu, i - 1);
+        if ((id == idPrev) && (id == kMenuSeparatorID)) {
+            RemoveMenu(menu, i, MF_BYPOSITION);
+            goto again3;
+        }
+    }
+}
+
+static void MenuSetEnabledForDocumentCommands(HMENU menu, bool hasDocument) {
+    for (int cmdId = (int)CmdFirst; cmdId <= (int)CmdLast; cmdId++) {
+        if (!CmdWorksWithoutDocument(cmdId)) {
+            MenuSetEnabled(menu, cmdId, hasDocument);
+        }
+    }
+}
+
+HMENU BuildMenuFromDef(MenuDef* menuDef, HMENU menu, BuildMenuCtx* ctx) {
+    ReportIf(!menu);
+
+    bool isDebugMenu = menuDef == menuDefDebug;
+    int i = 0;
+
+    if (menuDef == menuDefThemes) {
+        AppendThemesToMenu(menu);
+    }
+
+    bool addExternalViewersNext = false;
+    while (true) {
+        MenuDef md = menuDef[i];
+        if (len(md.title) == 0) { // sentinel
+            break;
+        }
+        i++;
+
+        if (addExternalViewersNext && ctx) {
+            // append user external viewers after menu item with CmdOpenWithHtmlHelp
+            WindowTab* tab = ctx->tab;
+            Str path = tab ? tab->filePath : Str{};
+            AppendExternalViewersToMenu(menu, path);
+            addExternalViewersNext = false;
+        }
+
+        int cmdId = (int)md.idOrSubmenu;
+
+        if (cmdId == CmdOpenWithHtmlHelp) {
+            addExternalViewersNext = true;
+        }
+
+        // TextSnippets go right after Free Text
+        bool snippetsHere = menuDef == menuDefCreateAnnotUnderCursor && md.idOrSubmenu == CmdAnnotationHighlightBrush;
+        if (snippetsHere && ctx && ctx->supportsAnnots) {
+            AppendTextSnippetsToMenu(menu);
+        }
+
+        // custom selection handlers go before the built-in translate / search submenus
+        if (md.idOrSubmenu == (UINT_PTR)menuDefTranslateWith) {
+            // handlers run on selected text; comics and images have none
+            bool canSelectText = !ctx || !ctx->isImageCollection;
+            if (canSelectText && menuDef == menuDefMainSelection) {
+                AppendSelectionHandlersToMenu(menu, true);
+            } else if (canSelectText && menuDef == menuDefSelection) {
+                AppendSelectionHandlersToMenu(menu, ctx ? ctx->hasSelection : false);
+            }
+        }
+
+        MenuDef* subMenuDef = (MenuDef*)md.idOrSubmenu;
+        // hacky but works: small number is command id, large is submenu (a pointer)
+        bool isSubMenu = md.idOrSubmenu > CmdLast + 10000;
+
+        // handle separators before command state checks
+        // (separators have idOrSubmenu=0 which would match the 0 sentinel in removal lists)
+        if (str::Eq(md.title, StrL(kMenuSeparator))) {
+            AppendMenuW(menu, MF_SEPARATOR, kMenuSeparatorID, nullptr);
             continue;
         }
 
-        AutoFreeWstr appName;
-        const WCHAR* name = ev->name;
-        if (str::IsEmpty(name)) {
-            WStrVec args;
-            ParseCmdLine(ev->commandLine, args, 2);
-            if (args.size() == 0) {
+        // Only real commands have a command-state. For submenu entries cmdId is a
+        // truncated pointer (garbage), so don't run it through GetCommandIdState:
+        // the no-document gate (and negative truncations) would wrongly remove the
+        // whole submenu, leaving e.g. an empty menu bar on the home page. Submenu
+        // visibility is decided by the explicit checks below and the emptiness
+        // check after the submenu is built.
+        bool removeMenu = false;
+        bool disableMenu = false;
+        // a null ctx means "don't auto-gate commands" -- the caller (e.g. the
+        // ToC / Favorites context menus) does its own per-item filtering and
+        // wants all items present. With an empty ctx, GetCommandIdState's
+        // no-document gate would wrongly strip document-dependent commands.
+        if (!isSubMenu && ctx) {
+            GetCommandIdState(ctx, cmdId, &removeMenu, &disableMenu);
+        }
+        if (ctx) {
+            removeMenu |= !ctx->isCursorOnPage && (subMenuDef == menuDefCreateAnnotUnderCursor);
+            // these annotations need text to mark up, except Highlight, which can
+            // fill a drawn rectangle
+            bool canMarkUp = ctx->hasTextSelection || ctx->hasDrawnRectSelection;
+            removeMenu |= (!canMarkUp || !ctx->supportsAnnots) && (subMenuDef == menuDefCreateAnnotFromSelection);
+            // in the context menu only show translate / search items for a text
+            // selection (the menubar variant is live-updated via
+            // SetMenuStateForSelection instead)
+            bool isTextSelSubMenu = (subMenuDef == menuDefTranslateWith) || (subMenuDef == menuDefSearchWith);
+            removeMenu |= (menuDef == menuDefSelection) && !ctx->hasTextSelection && isTextSelSubMenu;
+            bool isRectSel = ctx->hasSelection && !ctx->hasTextSelection;
+            if (menuDef == menuDefSelection) {
+                removeMenu |= !ctx->hasSelection && cmdId == CmdCopySelection;
+                if (!isRectSel) {
+                    removeMenu |= cmdId == CmdCopySelectionAsImage || cmdId == CmdSaveSelectionAsImage ||
+                                  cmdId == CmdPrintSelection || cmdId == CmdSearchGoogleLens ||
+                                  cmdId == CmdZoomToSelection;
+                }
+            }
+            if (menuDef == menuDefGoogleLens) {
+                removeMenu |= cmdId == CmdSearchGoogleLens && !ctx->hasSelection;
+                removeMenu |= cmdId == CmdSearchGoogleLensPage && !ctx->isCursorOnPage;
+                bool onImage = ctx->cursorOnImage || ctx->engineKind == kindEngineImage;
+                removeMenu |= cmdId == CmdSearchGoogleLensImage && !onImage;
+            }
+        }
+        removeMenu |= ((subMenuDef == menuDefDebug) && !ShowDebugMenu());
+        // without Annotations.SignatureImage it would just be Insert Image
+        removeMenu |= !isSubMenu && cmdId == CmdSignWithImage && len(gSettings->annotations.signatureImage) == 0;
+        if (removeMenu) {
+            continue;
+        }
+
+        bool noTranslate = isDebugMenu || cmdIdInList(menusNoTranslate);
+        noTranslate |= (subMenuDef == menuDefDebug);
+        Str title = md.title;
+        if (!noTranslate) {
+            title = Str(trans::GetTranslation(md.title));
+        }
+
+        if (isSubMenu) {
+            HMENU subMenu = BuildMenuFromDef(subMenuDef, CreatePopupMenu(), ctx);
+            if (GetMenuItemCount(subMenu) == 0) {
+                DestroyMenu(subMenu);
                 continue;
             }
-            appName.SetCopy(path::GetBaseNameNoFree(args.at(0)));
-            *(WCHAR*)path::GetExtNoFree(appName) = '\0';
+            UINT flags = MF_POPUP | (disableMenu ? MF_DISABLED : MF_ENABLED);
+            if (subMenuDef == menuDefFile) {
+                DynamicPartOfFileMenu(subMenu, ctx);
+            }
+            if (subMenuDef == menuDefReadAloud) {
+                SetReadAloudAppSubmenu(subMenu);
+            }
+            if (subMenuDef == menuDefContextReadAloud) {
+                SetReadAloudContextSubmenu(subMenu);
+            }
+            WCHAR* ws = CWStrTemp(title);
+            AppendMenuW(menu, flags, (UINT_PTR)subMenu, ws);
+        } else {
+            // Ctrl+C / Ctrl+V are bound to CmdCopySelection and
+            // CmdPasteClipboardImage, which hand off to these when an
+            // annotation is what there is to copy or paste. Show the key the
+            // user actually presses rather than nothing.
+            int accelCmdId = cmdId;
+            if (cmdId == CmdCopyAnnotation) {
+                accelCmdId = CmdCopySelection;
+            } else if (cmdId == CmdPasteAnnotation) {
+                accelCmdId = CmdPasteClipboardImage;
+            }
+            title = AppendAccelKeyToMenuStringTemp(title, accelCmdId);
+            UINT flags = MF_STRING | (disableMenu ? MF_DISABLED : MF_ENABLED);
+            WCHAR* ws = CWStrTemp(title);
+            AppendMenuW(menu, flags, md.idOrSubmenu, ws);
         }
-
-        AutoFreeWstr menuString(str::Format(_TR("Open in %s"), appName ? appName.Get() : name));
-        uint menuId = CmdOpenWithExternalFirst + count;
-        InsertMenuW(menuFile, CmdSendByEmail, MF_BYCOMMAND | MF_ENABLED | MF_STRING, menuId, menuString);
-        if (!filePath) {
-            win::menu::SetEnabled(menuFile, menuId, false);
-        }
-        count++;
     }
+    RemoveBadMenuSeparators(menu);
+    return menu;
 }
 
-// clang-format off
-static struct {
-    int itemId;
-    float zoom;
-} gZoomMenuIds[] = {
-    { CmdZoom6400,        6400.0 },
-    { CmdZoom3200,        3200.0 },
-    { CmdZoom1600,        1600.0 },
-    { CmdZoom800,         800.0  },
-    { CmdZoom400,         400.0  },
-    { CmdZoom200,         200.0  },
-    { CmdZoom150,         150.0  },
-    { CmdZoom125,         125.0  },
-    { CmdZoom100,         100.0  },
-    { CmdZoom50,          50.0   },
-    { CmdZoom25,          25.0   },
-    { CmdZoom12_5,        12.5   },
-    { CmdZoom8_33,        8.33f  },
-    { CmdZoomCustom,      0      },
-    { CmdZoomFitPage,    ZOOM_FIT_PAGE    },
-    { CmdZoomFitWidth,   ZOOM_FIT_WIDTH   },
-    { CmdZoomFitContent, ZOOM_FIT_CONTENT },
-    { CmdZoomActualSize, ZOOM_ACTUAL_SIZE },
-};
-// clang-format on
-
-int MenuIdFromVirtualZoom(float virtualZoom) {
-    int n = (int)dimof(gZoomMenuIds);
+static void BuildMenuZoom(HMENU m) {
+    auto* prefs = gSettings;
+    auto* customZoomLevels = prefs->zoomLevels;
+    int n = len(*customZoomLevels);
+    if (n <= 0) {
+        return;
+    }
+    MenuEmpty(m);
+    TempStr title;
+    int cmdId;
+    BuildMenuFromDef(menuDefZoomShort, m, nullptr);
     for (int i = 0; i < n; i++) {
-        if (virtualZoom == gZoomMenuIds[i].zoom) {
-            return gZoomMenuIds[i].itemId;
+        int idx = n - i - 1; // largest first
+        float zl = (*customZoomLevels)[idx];
+        cmdId = (*prefs->zoomLevelsCmdIds)[idx];
+        title = ZoomLevelStr(zl);
+        title = AppendAccelKeyToMenuStringTemp(title, cmdId);
+        UINT flags = MF_STRING | MF_ENABLED;
+        WCHAR* ws = CWStrTemp(title);
+        AppendMenuW(m, flags, cmdId, ws);
+    }
+}
+
+// Custom ZoomLevels menu items use dynamically allocated command ids (not in
+// CmdZoomFirst..CmdZoomLast). Map an absolute zoom % to that custom id, or 0.
+static int CustomZoomCmdIdFromLevel(float zoomVirtual) {
+    auto* prefs = gSettings;
+    if (!prefs || !prefs->zoomLevels || !prefs->zoomLevelsCmdIds) {
+        return 0;
+    }
+    int n = len(*prefs->zoomLevels);
+    if (n <= 0 || len(*prefs->zoomLevelsCmdIds) != n) {
+        return 0;
+    }
+    // same fuzz as DisplayModel::GetNextZoomStep
+    constexpr float kZoomFuzz = 0.01f;
+    for (int i = 0; i < n; i++) {
+        float zl = (*prefs->zoomLevels)[i];
+        if (zoomVirtual + kZoomFuzz >= zl && zoomVirtual - kZoomFuzz <= zl) {
+            return (*prefs->zoomLevelsCmdIds)[i];
         }
     }
-    return CmdZoomCustom;
+    return 0;
 }
 
-static float ZoomMenuItemToZoom(int menuItemId) {
-    for (int i = 0; i < dimof(gZoomMenuIds); i++) {
-        if (menuItemId == gZoomMenuIds[i].itemId) {
-            return gZoomMenuIds[i].zoom;
+static void ZoomMenuItemCheck(HMENU m, int cmdId, bool canZoom) {
+    for (int zi = 0; zi < gZoomMenuIdsCount; zi++) {
+        auto&& it = gZoomMenuIds[zi];
+        MenuSetEnabled(m, it.cmdId, canZoom);
+    }
+
+    auto* prefs = gSettings;
+    Vec<int>* customIds = prefs ? prefs->zoomLevelsCmdIds : nullptr;
+    int nCustom = customIds ? len(*customIds) : 0;
+    for (int i = 0; i < nCustom; i++) {
+        MenuSetEnabled(m, (*customIds)[i], canZoom);
+    }
+
+    // Uncheck all fixed zoom menu commands in the radio range
+    for (int zi = 0; zi < gZoomMenuIdsCount; zi++) {
+        auto&& it = gZoomMenuIds[zi];
+        MenuSetChecked(m, it.cmdId, false);
+    }
+    // Uncheck all custom ZoomLevels commands (ids are not a contiguous radio range)
+    for (int i = 0; i < nCustom; i++) {
+        MenuSetChecked(m, (*customIds)[i], false);
+    }
+
+    if (!canZoom || cmdId == 0) {
+        return;
+    }
+
+    // Fixed Fit*/Actual Size / built-in percentage commands
+    if (cmdId >= CmdZoomFirst && cmdId <= CmdZoomLast) {
+        if (CmdZoom100 == cmdId) {
+            cmdId = CmdZoomActualSize;
+        }
+        CheckMenuRadioItem(m, CmdZoomFirst, CmdZoomLast, cmdId, MF_BYCOMMAND);
+        if (CmdZoomActualSize == cmdId) {
+            // also mark 100% when present in the default menu
+            CheckMenuRadioItem(m, CmdZoom100, CmdZoom100, CmdZoom100, MF_BYCOMMAND);
+        }
+        return;
+    }
+
+    // Custom ZoomLevels percentage entry (issue #5832)
+    MenuSetChecked(m, cmdId, true);
+    // When at 100%, also mark "Actual Size" if present
+    if (nCustom > 0) {
+        int id100 = CustomZoomCmdIdFromLevel(100.0f);
+        if (id100 != 0 && id100 == cmdId) {
+            MenuSetChecked(m, CmdZoomActualSize, true);
         }
     }
-    CrashIf(true);
-    return 100.0;
 }
 
-static void ZoomMenuItemCheck(HMENU m, int menuItemId, bool canZoom) {
-    CrashIf((CmdZoomFirst > menuItemId) || (menuItemId > CmdZoomLast));
-
-    for (int i = 0; i < dimof(gZoomMenuIds); i++) {
-        win::menu::SetEnabled(m, gZoomMenuIds[i].itemId, canZoom);
-    }
-
-    if (CmdZoom100 == menuItemId) {
-        menuItemId = CmdZoomActualSize;
-    }
-    CheckMenuRadioItem(m, CmdZoomFirst, CmdZoomLast, menuItemId, MF_BYCOMMAND);
-    if (CmdZoomActualSize == menuItemId) {
-        CheckMenuRadioItem(m, CmdZoom100, CmdZoom100, CmdZoom100, MF_BYCOMMAND);
-    }
-}
-
-void MenuUpdateZoom(WindowInfo* win) {
-    float zoomVirtual = gGlobalPrefs->defaultZoomFloat;
+static void MenuUpdateZoom(MainWindow* win) {
+    float zoomVirtual = gSettings->defaultZoomFloat;
     if (win->IsDocLoaded()) {
         zoomVirtual = win->ctrl->GetZoomVirtual();
     }
-    int menuId = MenuIdFromVirtualZoom(zoomVirtual);
+
+    int menuId = 0;
+    // Prefer custom ZoomLevels command ids when that menu is active (issue #5832).
+    // Fit/virtual zooms still use fixed CmdZoomFit* ids.
+    if (zoomVirtual > 0) {
+        menuId = CustomZoomCmdIdFromLevel(zoomVirtual);
+    }
+    if (menuId == 0) {
+        menuId = CmdIdFromVirtualZoom(zoomVirtual);
+    }
     ZoomMenuItemCheck(win->menu, menuId, win->IsDocLoaded());
 }
 
-void MenuUpdatePrintItem(WindowInfo* win, HMENU menu, bool disableOnly = false) {
+static void MenuUpdatePrintItem(MainWindow* win, HMENU menu, bool disableOnly = false) {
     bool filePrintEnabled = win->IsDocLoaded();
-#ifndef DISABLE_DOCUMENT_RESTRICTIONS
-    bool filePrintAllowed = !filePrintEnabled || !win->AsFixed() || win->AsFixed()->GetEngine()->AllowsPrinting();
-#else
+#ifdef DISABLE_DOCUMENT_RESTRICTIONS
     bool filePrintAllowed = true;
+#else
+    bool filePrintAllowed = !filePrintEnabled || !win->AsFixed() || win->AsFixed()->GetEngine()->AllowsPrinting();
 #endif
 
-    int idx;
-    for (idx = 0; idx < dimof(menuDefFile) && menuDefFile[idx].id != CmdPrint; idx++) {
-        // do nothing
-    }
-    if (idx < dimof(menuDefFile)) {
-        const WCHAR* printItem = trans::GetTranslation(menuDefFile[idx].title);
+    for (MenuDef* defp = menuDefFile; len(defp->title) > 0 || defp->idOrSubmenu != 0; defp++) {
+        MenuDef& def = *defp;
+        if (def.idOrSubmenu != CmdPrint) {
+            continue;
+        }
+        TempStr printItem = trans::GetTranslation(def.title);
         if (!filePrintAllowed) {
-            printItem = _TR("&Print... (denied)");
+            printItem = Tr("&Print... (denied)");
+        } else {
+            printItem = AppendAccelKeyToMenuStringTemp(printItem, CmdPrint);
         }
         if (!filePrintAllowed || !disableOnly) {
-            ModifyMenuW(menu, CmdPrint, MF_BYCOMMAND | MF_STRING, (UINT_PTR)CmdPrint, printItem);
+            WCHAR* ws = CWStrTemp(printItem);
+            ModifyMenuW(menu, CmdPrint, MF_BYCOMMAND | MF_STRING, (UINT_PTR)CmdPrint, ws);
         }
+        MenuSetEnabled(menu, CmdPrint, filePrintEnabled && filePrintAllowed);
     }
+}
 
-    win::menu::SetEnabled(menu, CmdPrint, filePrintEnabled && filePrintAllowed);
+static void RebuildFileMenu(WindowTab* tab, HMENU menu) {
+    MenuEmpty(menu);
+    auto* ctx = NewBuildMenuCtx(tab, Point{0, 0});
+    AutoDelete delCtx(ctx);
+    BuildMenuFromDef(menuDefFile, menu, ctx);
+    DynamicPartOfFileMenu(menu, ctx);
+    RemoveBadMenuSeparators(menu);
 }
 
 static bool IsFileCloseMenuEnabled() {
-    for (size_t i = 0; i < gWindows.size(); i++) {
-        if (!gWindows.at(i)->IsAboutWindow()) {
+    for (int i = 0; i < len(gWindows); i++) {
+        if (gWindows[i]->IsDocLoaded()) {
             return true;
         }
     }
     return false;
 }
 
-static void MenuUpdateStateForWindow(WindowInfo* win) {
-    // those menu items will be disabled if no document is opened, enabled otherwise
-    static int menusToDisableIfNoDocument[] = {
-        CmdViewRotateLeft, CmdViewRotateRight,      CmdGoToNextPage,     CmdGoToPrevPage,  CmdGoToFirstPage,
-        CmdGoToLastPage,   CmdGoToNavBack,          CmdGoToNavForward,   CmdGoToPage,      CmdFindFirst,
-        CmdSaveAs,         CmdSaveAsBookmark,       CmdSendByEmail,      CmdSelectAll,     CmdCopySelection,
-        CmdProperties,     CmdViewPresentationMode, CmdOpenWithAcrobat,  CmdOpenWithFoxIt, CmdOpenWithPdfXchange,
-        CmdRenameFile,     CmdShowInFolder,         CmdDebugAnnotations,
-        // IDM_VIEW_WITH_XPS_VIEWER and IDM_VIEW_WITH_HTML_HELP
-        // are removed instead of disabled (and can remain enabled
-        // for broken XPS/CHM documents)
-    };
-    // this list coincides with menusToEnableIfBrokenPDF
-    static int menusToDisableIfDirectory[] = {
-        CmdRenameFile, CmdSendByEmail, CmdOpenWithAcrobat, CmdOpenWithFoxIt, CmdOpenWithPdfXchange, CmdShowInFolder,
-    };
-#define menusToEnableIfBrokenPDF menusToDisableIfDirectory
+static void SetMenuStateForSelection(WindowTab* tab, HMENU menu) {
+    bool isTextSelected = tab && tab->win && tab->win->showSelection && tab->selectionOnPage;
+    for (int i = 0; disableIfNoSelection[i]; i++) {
+        MenuSetEnabled(menu, (int)disableIfNoSelection[i], isTextSelected);
+    }
+    auto* curr = gFirstCustomCommand;
+    while (curr) {
+        if (curr->origId == CmdSelectionHandler) {
+            MenuSetEnabled(menu, curr->id, isTextSelected);
+        }
+        curr = curr->next;
+    }
+}
 
-    TabInfo* tab = win->currentTab;
-
-    for (int i = 0; i < dimof(menusToDisableIfNoDocument); i++) {
-        int id = menusToDisableIfNoDocument[i];
-        win::menu::SetEnabled(win->menu, id, win->IsDocLoaded());
+static void MenuUpdateDisplayMode(MainWindow* win) {
+    bool enabled = win->IsDocLoaded();
+    DisplayMode displayMode = gSettings->defaultDisplayModeEnum;
+    if (enabled) {
+        displayMode = win->ctrl->GetDisplayMode();
     }
 
-    // TODO: happens with UseTabs = false with .pdf files
-    SubmitCrashIf(IsFileCloseMenuEnabled() == win->IsAboutWindow());
-    win::menu::SetEnabled(win->menu, CmdClose, IsFileCloseMenuEnabled());
+    for (int id = CmdViewLayoutFirst; id <= CmdViewLayoutLast; id++) {
+        MenuSetEnabled(win->menu, id, enabled);
+    }
+
+    int id = 0;
+    if (IsSingle(displayMode)) {
+        id = CmdSinglePageView;
+    } else if (IsFacing(displayMode)) {
+        id = CmdFacingView;
+    } else if (IsBookView(displayMode)) {
+        id = CmdBookView;
+    } else {
+        ReportIf(win->ctrl || DisplayMode::Automatic != displayMode);
+    }
+
+    CheckMenuRadioItem(win->menu, CmdViewLayoutFirst, CmdViewLayoutLast, id, MF_BYCOMMAND);
+    MenuSetChecked(win->menu, CmdToggleContinuousView, IsContinuous(displayMode));
+    MenuSetChecked(win->menu, CmdToggleAutomaticallyScroll, ReadingAutoScrollIsOn(win));
+    MenuSetChecked(win->menu, CmdToggleReadingBar, ReadingBarIsOn(win));
+    MenuSetChecked(win->menu, CmdToggleReadingBarInvert, gSettings && gSettings->readingBar.invert);
+
+    DisplayModel* dm = win->AsFixed();
+    if (dm && win->CurrentTab()) {
+        bool mangaMode = dm->GetDisplayR2L();
+        MenuSetChecked(win->menu, CmdToggleMangaMode, mangaMode);
+        MenuSetEnabled(win->menu, CmdToggleMangaMode, true);
+        MenuSetChecked(win->menu, CmdToggleAutoRotateWidePages, gSettings->comicBookUI.autoRotateWidePages);
+        MenuSetChecked(win->menu, CmdToggleUniformPageWidth, dm->GetUniformPageWidth());
+        MenuSetEnabled(win->menu, CmdToggleUniformPageWidth, true);
+        MenuSetChecked(win->menu, CmdToggleTrimEmptyMargins, dm->GetTrimEmptyMargins());
+        MenuSetEnabled(win->menu, CmdToggleTrimEmptyMargins, true);
+        MenuSetChecked(win->menu, CmdToggleMirror, dm->GetMirror());
+        MenuSetEnabled(win->menu, CmdShowWholePages, !dm->GetUserCrop().IsEmpty());
+        MenuSetEnabled(win->menu, CmdSaveTrimmedPagesAs, !dm->GetUserCrop().IsEmpty() || dm->GetTrimEmptyMargins());
+        MenuSetChecked(win->menu, CmdToggleReadColumns, dm->GetReadColumns());
+        MenuSetEnabled(win->menu, CmdToggleColumnsWholePage, dm->GetReadColumns());
+        MenuSetChecked(win->menu, CmdToggleColumnsWholePage, dm->ShowsColumnsWholePage());
+    }
+}
+
+static void MenuUpdateStateForWindow(MainWindow* win) {
+    WindowTab* tab = win->CurrentTab();
+
+    bool hasDocument = tab && tab->IsDocLoaded();
+    MenuSetEnabledForDocumentCommands(win->menu, hasDocument);
+
+    SetMenuStateForSelection(tab, win->menu);
+    MenuSetEnabled(win->menu, CmdClose, IsFileCloseMenuEnabled());
 
     MenuUpdatePrintItem(win, win->menu);
 
-    bool enabled = win->IsDocLoaded() && tab && tab->ctrl->HacToc();
-    win::menu::SetEnabled(win->menu, CmdViewBookmarks, enabled);
+    bool enabled = win->IsDocLoaded() && tab && tab->ctrl->HasToc();
+    MenuSetEnabled(win->menu, CmdToggleBookmarks, enabled);
 
     bool documentSpecific = win->IsDocLoaded();
-    bool checked = documentSpecific ? win->tocVisible : gGlobalPrefs->showToc;
-    win::menu::SetChecked(win->menu, CmdViewBookmarks, checked);
+    bool bookmarksShown = IsSidebarViewShown(win, SidebarView::Bookmarks);
+    bool checked = documentSpecific ? bookmarksShown : gSettings->showToc;
+    MenuSetChecked(win->menu, CmdToggleBookmarks, checked);
+    MenuSetEnabled(win->menu, CmdToggleThumbnails, CanShowThumbnails(tab));
+    MenuSetChecked(win->menu, CmdToggleThumbnails, IsSidebarViewShown(win, SidebarView::Thumbnails));
 
-    win::menu::SetChecked(win->menu, CmdFavoriteToggle, gGlobalPrefs->showFavorites);
-    win::menu::SetChecked(win->menu, CmdViewShowHideToolbar, gGlobalPrefs->showToolbar);
-    win::menu::SetChecked(win->menu, CmdViewShowHideScrollbars, !gGlobalPrefs->fixedPageUI.hideScrollbars);
+    MenuSetChecked(win->menu, CmdFavoriteToggle, IsSidebarViewShown(win, SidebarView::Favorites));
+    MenuSetChecked(win->menu, CmdFavoriteShowInTab, FindFavoritesTab(win) != nullptr);
+    {
+        // checked when mode is not "hide" (show or overlay)
+        bool toolbarOn =
+            win->IsFullScreen() ? FullscreenToolbarModeFromPrefs() != kToolbarHide : !ToolbarModeIsHidden();
+        MenuSetChecked(win->menu, CmdToggleToolbar, toolbarOn);
+    }
+    MenuSetChecked(win->menu, CmdToggleMenuBar, gSettings->showMenubar);
+    MenuSetChecked(win->menu, CmdToggleCaption, gSettings->showCaption);
+    MenuSetChecked(win->menu, CmdToggleSidebarAutoHide, gSettings->sidebarAutoHide);
+    // CmdChangeScrollbar doesn't need a check mark - it opens a dialog
     MenuUpdateDisplayMode(win);
     MenuUpdateZoom(win);
 
     if (win->IsDocLoaded() && tab) {
-        win::menu::SetEnabled(win->menu, CmdGoToNavBack, tab->ctrl->CanNavigate(-1));
-        win::menu::SetEnabled(win->menu, CmdGoToNavForward, tab->ctrl->CanNavigate(1));
+        MenuSetEnabled(win->menu, CmdNavigateBack, tab->ctrl->CanNavigate(-1));
+        MenuSetEnabled(win->menu, CmdNavigateForward, tab->ctrl->CanNavigate(1));
     }
 
     // TODO: is this check too expensive?
     bool fileExists = tab && file::Exists(tab->filePath);
 
     if (tab && tab->ctrl && !fileExists && dir::Exists(tab->filePath)) {
-        for (int i = 0; i < dimof(menusToDisableIfDirectory); i++) {
-            int id = menusToDisableIfDirectory[i];
-            win::menu::SetEnabled(win->menu, id, false);
+        for (int id : disableIfDirectoryOrBrokenPDF) {
+            MenuSetEnabled(win->menu, id, false);
         }
     } else if (fileExists && CouldBePDFDoc(tab)) {
-        for (int i = 0; i < dimof(menusToEnableIfBrokenPDF); i++) {
-            int id = menusToEnableIfBrokenPDF[i];
-            win::menu::SetEnabled(win->menu, id, true);
+        for (int id : disableIfDirectoryOrBrokenPDF) {
+            MenuSetEnabled(win->menu, id, true);
         }
     }
 
     DisplayModel* dm = tab ? tab->AsFixed() : nullptr;
     EngineBase* engine = dm ? dm->GetEngine() : nullptr;
     if (engine) {
-        win::menu::SetEnabled(win->menu, CmdFindFirst, !engine->IsImageCollection());
+        MenuSetEnabled(win->menu, CmdFindFirst, !engine->isImageCollection);
     }
 
     if (win->IsDocLoaded() && !fileExists) {
-        win::menu::SetEnabled(win->menu, CmdRenameFile, false);
+        MenuSetEnabled(win->menu, CmdRenameFile, false);
+        MenuSetEnabled(win->menu, CmdDeleteFile, false);
+        MenuSetEnabled(win->menu, CmdDeleteFileAndOpenNext, false);
     }
 
-#if defined(ENABLE_THEME)
-    CheckMenuRadioItem(win->menu, IDM_CHANGE_THEME_FIRST, IDM_CHANGE_THEME_LAST,
-                       IDM_CHANGE_THEME_FIRST + GetCurrentThemeIndex(), MF_BYCOMMAND);
-#endif
+    CheckMenuRadioItem(win->menu, gFirstSetThemeCmdId, gLastSetThemeCmdId, gCurrSetThemeCmdId, MF_BYCOMMAND);
 
-    win::menu::SetChecked(win->menu, CmdDebugShowLinks, gDebugShowLinks);
-    win::menu::SetChecked(win->menu, CmdDebugEbookUI, gGlobalPrefs->ebookUI.useFixedPageUI);
-    win::menu::SetChecked(win->menu, CmdDebugMui, mui::IsDebugPaint());
-    win::menu::SetEnabled(win->menu, CmdDebugAnnotations,
-                          tab && tab->selectionOnPage && win->showSelection && EngineSupportsAnnotations(engine));
+    MenuSetChecked(win->menu, CmdToggleLinks, gSettings->showLinks);
+    MenuSetChecked(win->menu, CmdTogglePageBoxes, win->showPageBoxes);
+    MenuSetChecked(win->menu, CmdToggleHighlightFormFields, gSettings->highlightFormFields);
+    MenuSetChecked(win->menu, CmdToggleTransparencyGrid, ShowTransparencyGrid());
+    MenuSetChecked(win->menu, CmdTogglePageGrid, ShowPageGrid());
+    MenuSetChecked(win->menu, CmdMeasure, win->measurementToolbar != nullptr);
+    MenuSetChecked(win->menu, CmdToggleImages, ShowImageOutlines());
+    MenuSetChecked(win->menu, CmdDebugShowFitContentArea, ShowFitContentArea());
+    MenuSetEnabled(win->menu, CmdTabGroupSave, HasOpenedDocuments(win));
+    MenuSetChecked(win->menu, CmdToggleFilePicker, gSettings && str::EqI(gSettings->filePicker, StrL("sumatrapdf")));
 }
 
-void OnAboutContextMenu(WindowInfo* win, int x, int y) {
-    if (!HasPermission(Perm_SavePreferences | Perm_DiskAccess) || !gGlobalPrefs->rememberOpenedFiles ||
-        !gGlobalPrefs->showStartPage) {
+void OnAboutContextMenu(MainWindow* win, int x, int y) {
+    if (!HasPermission(Perm::SavePreferences | Perm::DiskAccess) || !SettingsRememberOpenedFiles() ||
+        !gSettings->showStartPage) {
         return;
     }
 
-    const WCHAR* filePath = GetStaticLink(win->staticLinks, x, y);
-    if (!filePath || *filePath == '<' || str::StartsWith(filePath, L"http://") ||
-        str::StartsWith(filePath, L"https://")) {
+    // Prefer the file under the click; keyboard/context-menu key falls back to
+    // the keyboard-selected home entry.
+    TempStr path = HomePageFilePathAtTemp(win, x, y);
+    bool fromClick = path && path::IsAbsolute(path);
+    if (!fromClick) {
+        path = str::DupTemp(HomePageSelectedFilePathTemp(win));
+    }
+    if (len(path) == 0 || !path::IsAbsolute(path)) {
         return;
     }
 
-    DisplayState* state = gFileHistory.Find(filePath, nullptr);
-    CrashIf(!state);
-    if (!state) {
+    // Keep keyboard selection in sync with the right-clicked thumbnail
+    if (fromClick) {
+        HomePageOnHover(win, x, y);
+    }
+
+    FileState* fs = FileHistoryFindByPath(path);
+    if (!fs) {
         return;
     }
 
-    HMENU popup = BuildMenuFromMenuDef(menuDefContextStart, CreatePopupMenu());
-    win::menu::SetChecked(popup, CmdPinSelectedDocument, state->isPinned);
-    POINT pt = {x, y};
-    MapWindowPoints(win->hwndCanvas, HWND_DESKTOP, &pt, 1);
-    MarkMenuOwnerDraw(popup);
+    BuildMenuCtx ctx;
+    ctx.isDocLoaded = true;
+    ctx.filePath = path;
+    HMENU popup = BuildMenuFromDef(menuDefContextStart, CreatePopupMenu(), &ctx);
+    MenuSetChecked(popup, CmdPinSelectedDocument, fs->isPinned);
+    // Del is home-page-only (not a global accelerator), so AppendAccelKey won't
+    // pick it up — show it next to Remove From History explicitly
+    MenuSetText(popup, CmdForgetSelectedDocument, str::JoinTemp(Tr("&Remove From History"), StrL("\tDel")));
+    Point pt = HwndMapWindowPoint(win->hwndCanvas, HWND_DESKTOP, {x, y});
+    // keyboard menu (no hit under the cursor): place at cursor or near the frame
+    if (!fromClick) {
+        Point cursor = GetCursorPosition();
+        if (!cursor.IsEmpty()) {
+            pt = cursor;
+        } else {
+            Rect rc = HwndWindowRect(win->hwndFrame);
+            pt = Point(rc.x + 40, rc.y + 80);
+        }
+    }
     INT cmd = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
-    FreeMenuOwnerDrawInfoData(popup);
     DestroyMenu(popup);
 
     if (CmdOpenSelectedDocument == cmd) {
-        LoadArgs args(filePath, win);
-        LoadDocument(args);
+        LoadArgs args(path, win);
+        args.activateExisting = !IsCtrlPressed();
+        args.activateExistingInWindow = true;
+        LoadDocument(&args);
+        return;
+    }
+
+    if (CmdShowInFolder == cmd) {
+        ShowFileInFolder(win, path);
+        return;
+    }
+
+    if (CmdDeleteFile == cmd) {
+        if (!CanAccessDisk() || gPluginMode) {
+            return;
+        }
+        // own the path: delete closes tabs and rewrites history
+        TempStr pathOwned = str::DupTemp(path);
+        if (file::Exists(pathOwned)) {
+            WindowTab* tab = FindTabByFilePath(pathOwned);
+            if (tab) {
+                if (!MaybeSaveAnnotations(tab)) {
+                    return;
+                }
+                CloseTab(tab, false);
+            }
+            DeleteFileFromDiskAndHistory(pathOwned);
+        } else {
+            // missing file: still drop it from history
+            ForgetFileFromFrequentlyRead(win, pathOwned);
+            return;
+        }
+        if (IsMainWindowValidAndNotClosing(win)) {
+            win->DeleteToolTip();
+            win->RedrawAll(true);
+        }
         return;
     }
 
     if (CmdPinSelectedDocument == cmd) {
-        state->isPinned = !state->isPinned;
-        win->HideToolTip();
+        fs->isPinned = !fs->isPinned;
+        win->DeleteToolTip();
         win->RedrawAll(true);
         return;
     }
 
     if (CmdForgetSelectedDocument == cmd) {
-        if (state->favorites->size() > 0) {
-            // just hide documents with favorites
-            gFileHistory.MarkFileInexistent(state->filePath, true);
-        } else {
-            gFileHistory.Remove(state);
-            DeleteDisplayState(state);
-        }
-        CleanUpThumbnailCache(gFileHistory);
-        win->HideToolTip();
-        win->RedrawAll(true);
+        ForgetFileFromFrequentlyRead(win, path);
         return;
     }
 }
 
-// TODO: return false in fullscreen
-static bool ShouldShowCreateAnnotationMenu(TabInfo* tab, int x, int y) {
-    DisplayModel* dm = tab->AsFixed();
-    if (!dm) {
-        return false;
+// removes a file from the Frequently Read list on the home page. Files with
+// favorites are only hidden (so the favorites aren't lost). Used by both the
+// context menu and the per-thumbnail ✕ button (issue #283).
+void ForgetFileFromFrequentlyRead(MainWindow* win, Str filePath) {
+    FileState* fs = FileHistoryFindByPath(filePath);
+    if (!fs) {
+        return;
     }
-    Kind engineType = dm->GetEngineType();
-    if (engineType != kindEnginePdf) {
-        return false;
+    TempStr path = str::DupTemp(fs->filePath);
+    if (len(*fs->favorites) > 0) {
+        // only hide documents with favorites
+        FileHistoryDemote(fs->filePath, true);
+    } else {
+        FileHistoryRemove(fs);
+        DeleteFileState(fs);
     }
-    int pageNo = dm->GetPageNoByPoint(Point{x, y});
-    if (pageNo < 0) {
-        return false;
-    }
-    return true;
+    DeleteThumbnailForFile(path);
+    ScheduleSaveSettings();
+    win->DeleteToolTip();
+    win->RedrawAll(true);
 }
 
-void OnWindowContextMenu(WindowInfo* win, int x, int y) {
+void OnWindowContextMenu(MainWindow* win, int x, int y) {
     DisplayModel* dm = win->AsFixed();
-    CrashIf(!dm);
+    ReportIf(!dm);
     if (!dm) {
         return;
     }
 
-    TabInfo* tab = win->currentTab;
-    IPageElement* pageEl = dm->GetElementAtPos({x, y});
-    WCHAR* value = nullptr;
+    Point cursorPos{x, y};
+    WindowTab* tab = win->CurrentTab();
+    int pageNoUnderEl = 0;
+    IPageElement* pageEl = dm->GetElementAtPos(cursorPos, &pageNoUnderEl);
+
+    Str value = {};
     if (pageEl) {
         value = pageEl->GetValue();
     }
 
-    HMENU popup = BuildMenuFromMenuDef(menuDefContext, CreatePopupMenu());
+    auto* ctx = NewBuildMenuCtx(tab, cursorPos);
+    AutoDelete delCtx(ctx);
+    HMENU popup = BuildMenuFromDef(menuDefContext, CreatePopupMenu(), ctx);
 
-    bool showBookmarksMenu = IsTocEditorEnabledForWindowInfo(tab);
-    if (!showBookmarksMenu) {
-        win::menu::Remove(popup, CmdNewBookmarks);
-    } else {
-        auto path = tab->filePath.Get();
-        if (str::EndsWithI(path, L".vbkm")) {
-            // for .vbkm change wording from "New Bookmarks" => "Edit Bookmarks"
-            win::menu::SetText(popup, CmdNewBookmarks, _TR("Edit Bookmarks"));
-        }
+    // in fullscreen, add "Menu" as first item containing the full menu bar
+    bool isFullScreen = win->IsFullScreenOrPresentation();
+    if (isFullScreen) {
+        HMENU menuBarCopy = BuildMenuFromDef(menuDefMenubar, CreatePopupMenu(), ctx);
+        WCHAR* menuLabel = CWStrTemp(Tr("Menu"));
+        MENUITEMINFOW mii{};
+        mii.cbSize = sizeof(mii);
+        mii.fMask = MIIM_STRING | MIIM_SUBMENU;
+        mii.hSubMenu = menuBarCopy;
+        mii.dwTypeData = menuLabel;
+        InsertMenuItemW(popup, 0, TRUE, &mii);
     }
 
-    bool showCreateAnnotations = ShouldShowCreateAnnotationMenu(tab, x, y);
-    if (showCreateAnnotations) {
-        MenuDef* mdef = menuDefCreateAnnot;
-        if (gIsRaMicroBuild) {
-            mdef = menuDefCreateAnnotRaMicro;
-        }
-        HMENU popupCreateAnnot = BuildMenuFromMenuDef(mdef, CreatePopupMenu());
-        uint flags = MF_BYPOSITION | MF_ENABLED | MF_POPUP;
-        InsertMenuW(popup, (uint)-1, flags, (UINT_PTR)popupCreateAnnot, _TR("Create Annotation"));
-
-        bool isTextSelection = win->showSelection && tab->selectionOnPage;
-        if (!isTextSelection) {
-            win::menu::SetEnabled(popupCreateAnnot, CmdCreateAnnotHighlight, false);
-            win::menu::SetEnabled(popupCreateAnnot, CmdCreateAnnotUnderline, false);
-            win::menu::SetEnabled(popupCreateAnnot, CmdCreateAnnotStrikeOut, false);
-            win::menu::SetEnabled(popupCreateAnnot, CmdCreateAnnotSquiggly, false);
-            win::menu::SetEnabled(popupCreateAnnot, CmdCreateAnnotRedact, false);
-        }
-    }
-
-    if (!pageEl || !pageEl->Is(kindPageElementDest) || !value) {
-        win::menu::Remove(popup, CmdCopyLinkTarget);
-    }
-    if (!pageEl || !pageEl->Is(kindPageElementComment) || !value) {
-        win::menu::Remove(popup, CmdCopyComment);
-    }
-    if (!pageEl || !pageEl->Is(kindPageElementImage)) {
-        win::menu::Remove(popup, CmdCopyImage);
-    }
-
-    bool isFullScreen = win->isFullScreen || win->presentation;
-    if (!isFullScreen) {
-        win::menu::Remove(popup, CmdExitFullScreen);
-    }
-    if (!tab->selectionOnPage) {
-        win::menu::SetEnabled(popup, CmdCopySelection, false);
-    }
-    MenuUpdatePrintItem(win, popup, true);
-    win::menu::SetEnabled(popup, CmdViewBookmarks, win->ctrl->HacToc());
-    win::menu::SetChecked(popup, CmdViewBookmarks, win->tocVisible);
-
-    win::menu::SetChecked(popup, CmdViewShowHideScrollbars, !gGlobalPrefs->fixedPageUI.hideScrollbars);
-
-    win::menu::SetEnabled(popup, CmdFavoriteToggle, HasFavorites());
-    win::menu::SetChecked(popup, CmdFavoriteToggle, gGlobalPrefs->showFavorites);
-
+    int pageNoUnderCursor = dm->GetPageNoByPoint(cursorPos);
     EngineBase* engine = dm->GetEngine();
-    bool showCreateAnnotation = EngineSupportsAnnotations(engine);
 
-    int pageNo = dm->GetPageNoByPoint(Point{x, y});
-    PointF ptOnPage = dm->CvtFromScreen(Point{x, y}, pageNo);
-    if (showCreateAnnotation) {
-        if (pageNo <= 0) {
-            showCreateAnnotation = false;
-        }
-    }
-
-    bool enableSaveAnnotations = false;
-    bool canDoAnnotations = gIsDebugBuild || gIsPreReleaseBuild || gIsDailyBuild;
-    if (canDoAnnotations) {
-        enableSaveAnnotations = EngineHasUnsavedAnnotations(engine);
-    } else {
-        showCreateAnnotation = false;
-    }
-    win::menu::SetEnabled(popup, CmdSaveAnnotations, enableSaveAnnotations);
-
-    const WCHAR* filePath = win->ctrl->FilePath();
-    if (pageNo > 0) {
-        AutoFreeWstr pageLabel = win->ctrl->GetPageLabel(pageNo);
-        bool isBookmarked = gFavorites.IsPageInFavorites(filePath, pageNo);
-        if (isBookmarked) {
-            win::menu::Remove(popup, CmdFavoriteAdd);
-
-            // %s and not %d because re-using translation from RebuildFavMenu()
-            auto tr = _TR("Remove page %s from favorites");
-            AutoFreeWstr s = str::Format(tr, pageLabel.Get());
-            win::menu::SetText(popup, CmdFavoriteDel, s);
+    bool onImage = pageEl && pageEl->Is(kindPageElementImage);
+    onImage = onImage || (engine && engine->kind == kindEngineImage);
+    if (pageNoUnderCursor > 0) {
+        TempStr pageItem;
+        if (ShowChapterUi(win->ctrl)) {
+            Location loc = win->ctrl->LocationFromPageNo(pageNoUnderCursor);
+            pageItem = fmt(Tr("Chapter %d Page %d").s, loc.chapter, loc.page);
         } else {
-            win::menu::Remove(popup, CmdFavoriteDel);
-
-            // %s and not %d because re-using translation from RebuildFavMenu()
-            auto tr = _TR("Add page %s to favorites\tCtrl+B");
-            AutoFreeWstr s = str::Format(tr, pageLabel.Get());
-            win::menu::SetText(popup, CmdFavoriteAdd, s);
+            TempStr pageLabel = win->ctrl->GetPageLabeTemp(pageNoUnderCursor);
+            pageItem = fmt(Tr("Page %s").s, pageLabel);
         }
-    } else {
-        win::menu::Remove(popup, CmdFavoriteAdd);
-        win::menu::Remove(popup, CmdFavoriteDel);
+        MenuSetText(popup, CmdSearchGoogleLensPage, pageItem);
+    }
+
+    win->contextMenuPt = cursorPos;
+    bool isImageDoc = engine && (engine->isImageCollection || engine->kind == kindEngineImage ||
+                                 engine->kind == kindEngineImageDir || engine->kind == kindEngineComicBooks);
+    win->contextMenuPtValid = !isImageDoc && ReadAloudCanReadFromCursor(dm, cursorPos);
+    HMENU readAloudCtxMenu = GetReadAloudContextSubmenu();
+    // no text to speak on comics / image folders / single images
+    if (readAloudCtxMenu && !isImageDoc) {
+        RebuildReadAloudMenu(win, readAloudCtxMenu, true, win->contextMenuPtValid);
+    }
+
+    if (!pageEl || !pageEl->Is(kindPageElementDest) || !PageDestHasAddress(pageEl->AsLink())) {
+        MenuRemove(popup, CmdCopyLinkTarget);
+    }
+    bool hasCommentToCopy = pageEl && pageEl->Is(kindPageElementComment) && value;
+    if (ctx->annotationUnderCursor) {
+        hasCommentToCopy = !str::IsEmptyOrWhiteSpace(Contents(ctx->annotationUnderCursor));
+    }
+    if (!hasCommentToCopy) {
+        MenuRemove(popup, CmdCopyComment);
+    }
+    // show "Save Attachment" only for file attachment annotations
+    {
+        bool isFileAttachment = false;
+        if (pageEl && pageEl->Is(kindPageElementDest)) {
+            IPageDestination* elDest = pageEl->AsLink();
+            if (elDest && elDest->GetKind() == kindDestinationLaunchEmbedded) {
+                isFileAttachment = true;
+            }
+        }
+        if (!isFileAttachment) {
+            MenuRemove(popup, CmdSaveAttachment);
+        }
+    }
+    {
+        bool isImageEngine = tab && tab->GetEngineType() == kindEngineImage;
+        if (!onImage && !isImageEngine) {
+            MenuRemove(popup, CmdCopyImage);
+        }
+        if (!onImage) {
+            MenuRemove(popup, CmdSaveImage);
+        }
+        if (!pageEl || !pageEl->Is(kindPageElementImage)) {
+            MenuRemove(popup, CmdReplaceImage);
+            MenuRemove(popup, CmdEditImageExternally);
+        }
+        if (!isImageEngine && !onImage) {
+            MenuRemove(popup, CmdCropImage);
+            MenuRemove(popup, CmdResizeImage);
+            MenuRemove(popup, CmdConvertImageToPdf);
+        }
+        // remove the Image submenu entirely if no items left
+        if (!onImage && !isImageEngine) {
+            // find and remove the submenu by scanning top-level items
+            int n = GetMenuItemCount(popup);
+            for (int j = 0; j < n; j++) {
+                HMENU sub = GetSubMenu(popup, j);
+                if (sub && GetMenuItemCount(sub) == 0) {
+                    RemoveMenu(popup, j, MF_BYPOSITION);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!engine || !engine->HasErrors()) {
+        MenuRemove(popup, CmdShowErrors);
+    }
+
+    if (!isFullScreen) {
+        MenuRemove(popup, CmdToggleFullscreen);
+    }
+    SetMenuStateForSelection(tab, popup);
+
+    MenuUpdatePrintItem(win, popup, true);
+    MenuSetEnabled(popup, CmdToggleBookmarks, win->ctrl->HasToc());
+    MenuSetChecked(popup, CmdToggleBookmarks, IsSidebarViewShown(win, SidebarView::Bookmarks));
+    MenuSetEnabled(popup, CmdToggleThumbnails, CanShowThumbnails(tab));
+    MenuSetChecked(popup, CmdToggleThumbnails, IsSidebarViewShown(win, SidebarView::Thumbnails));
+
+    MenuSetEnabled(popup, CmdFavoriteToggle, HasFavorites());
+    MenuSetChecked(popup, CmdFavoriteToggle, IsSidebarViewShown(win, SidebarView::Favorites));
+    MenuSetEnabled(popup, CmdFavoriteShowInTab, HasFavorites() && SettingsUseTabs());
+    MenuSetEnabled(popup, CmdEditFavorites, HasFavorites());
+    MenuSetChecked(popup, CmdFavoriteShowInTab, FindFavoritesTab(win) != nullptr);
+
+    Str filePath = win->ctrl->GetFilePath();
+    bool favsSupported = HasPermission(Perm::SavePreferences) && CanAccessDisk();
+    if (favsSupported) {
+        if (pageNoUnderCursor > 0) {
+            bool isBookmarked = IsPageInFavorites(filePath, pageNoUnderCursor, win->ctrl);
+
+            TempStr addText;
+            TempStr delText;
+            if (ShowChapterUi(win->ctrl)) {
+                Location loc = win->ctrl->LocationFromPageNo(pageNoUnderCursor);
+                addText = fmt(Tr("Add chapter %d page %d to favorites").s, loc.chapter, loc.page);
+                delText = fmt(Tr("Remove chapter %d page %d from favorites").s, loc.chapter, loc.page);
+            } else {
+                TempStr pageLabel = win->ctrl->GetPageLabeTemp(pageNoUnderCursor);
+                addText = fmt(Tr("Add page %s to favorites").s, pageLabel);
+                delText = fmt(Tr("Remove page %s from favorites").s, pageLabel);
+            }
+
+            if (isBookmarked) {
+                MenuRemove(popup, CmdFavoriteAdd);
+                MenuSetText(popup, CmdFavoriteDel, delText);
+            } else {
+                MenuRemove(popup, CmdFavoriteDel);
+                TempStr s = AppendAccelKeyToMenuStringTemp(addText, CmdFavoriteAdd);
+                MenuSetText(popup, CmdFavoriteAdd, s);
+            }
+        } else {
+            MenuRemove(popup, CmdFavoriteAdd);
+            MenuRemove(popup, CmdFavoriteDel);
+        }
     }
 
     // if toolbar is not shown, add option to show it
-    if (gGlobalPrefs->showToolbar) {
-        win::menu::Remove(popup, CmdViewShowHideToolbar);
+    if (gSettings->showToolbar) {
+        MenuRemove(popup, CmdToggleToolbar);
+    }
+    RemoveBadMenuSeparators(popup);
+
+    // highlight the element under cursor while context menu is open
+    if (pageEl && pageNoUnderEl > 0) {
+        win->contextMenuHighlightRect = pageEl->GetRect();
+        win->contextMenuHighlightPageNo = pageNoUnderEl;
+        HwndRepaintNow(win->hwndCanvas);
     }
 
-    POINT pt = {x, y};
-    MapWindowPoints(win->hwndCanvas, HWND_DESKTOP, &pt, 1);
-    MarkMenuOwnerDraw(popup);
-    uint flags = TPM_RETURNCMD | TPM_RIGHTBUTTON;
-    int cmd = TrackPopupMenu(popup, flags, pt.x, pt.y, 0, win->hwndFrame, nullptr);
-    FreeMenuOwnerDrawInfoData(popup);
+    Point pt = HwndMapWindowPoint(win->hwndCanvas, HWND_DESKTOP, {x, y});
+    UINT flags = TPM_RETURNCMD | TPM_RIGHTBUTTON;
+    int cmdId = TrackPopupMenu(popup, flags, pt.x, pt.y, 0, win->hwndFrame, nullptr);
     DestroyMenu(popup);
 
-    AnnotationType annotType = (AnnotationType)(cmd - CmdCreateAnnotText);
+    // TrackPopupMenu runs a nested message loop; during that time the window
+    // can be force-closed (e.g. by a plugin host destroying the parent).
+    // If that happened, all our cached pointers (win, dm, pageEl, etc.) are dangling.
+    // DDE or a reload can also replace the document while the window lives on.
+    if (!IsMainWindowValidAndNotClosing(win) || win->AsFixed() != dm || win->CurrentTab() != tab) {
+        return;
+    }
 
-    switch (cmd) {
-        case CmdCopySelection:
-        case CmdSelectAll:
-        case CmdSaveAs:
-        case CmdPrint:
-        case CmdViewBookmarks:
-        case CmdFavoriteToggle:
-        case CmdProperties:
-        case CmdViewShowHideToolbar:
-        case CmdViewShowHideScrollbars:
-        case CmdSaveAnnotations:
-        case CmdNewBookmarks:
-            HwndSendCommand(win->hwndFrame, cmd);
-            break;
-        case CmdEditAnnotations:
-            StartEditAnnotations(tab, nullptr);
-            break;
+    // clear the highlight after context menu closes
+    if (win->contextMenuHighlightPageNo > 0) {
+        win->contextMenuHighlightPageNo = 0;
+        HwndRepaintNow(win->hwndCanvas);
+    }
+
+    auto* cmd = FindCustomCommand(cmdId);
+    if (cmd && cmd->origId == CmdSelectionHandler) {
+        HwndSendCommand(win->hwndFrame, cmd->id);
+        return;
+    }
+    // a text snippet goes where the menu was opened
+    if (cmd && cmd->origId == CmdInsertTextSnippet) {
+        HwndSendCommand(win->hwndFrame, cmd->id, MAKELPARAM(x, y));
+        return;
+    }
+
+    // handle in FrameOnCommand() in SumatraPDF.cpp
+    if (CommandUsesContextMenuPoint(cmdId)) {
+        LPARAM lpArg = MAKELPARAM(x, y);
+        HwndSendCommand(win->hwndFrame, cmdId, lpArg);
+        return;
+    }
+
+    switch (cmdId) {
+        case CmdSearchGoogleLens:
+            SearchGoogleLensSelection(tab);
+            return;
+        case CmdSearchGoogleLensPage:
+            SearchGoogleLensPage(tab, pageNoUnderCursor);
+            return;
+        case CmdSearchGoogleLensImage:
+            SearchGoogleLensImage(tab, pageEl);
+            return;
+        case CmdReplaceImage:
+            ReplaceImageFromFile(win, pageEl);
+            return;
+        case CmdEditImageExternally:
+            EditImageExternally(win, pageEl);
+            return;
+        case CmdSaveImage:
+        case CmdCropImage:
+        case CmdResizeImage:
+        case CmdConvertImageToPdf: {
+            if (!pageEl || !pageEl->Is(kindPageElementImage)) {
+                HwndSendCommand(win->hwndFrame, cmdId);
+                return;
+            }
+            EngineBase* imgEngine = dm->GetEngine();
+            ImageEditMode m = ImageEditMode::Save;
+            bool selectPdf = false;
+            if (cmdId == CmdCropImage) {
+                m = ImageEditMode::Crop;
+            } else if (cmdId == CmdResizeImage) {
+                m = ImageEditMode::Resize;
+            } else if (cmdId == CmdConvertImageToPdf) {
+                selectPdf = true;
+            }
+            // a standalone image file: load from disk so Save can write the original
+            // bytes when the image is not cropped or resized
+            if (imgEngine->kind == kindEngineImage && imgEngine->FilePath()) {
+                ShowImageEditWindow(win->hwndFrame, m, imgEngine->FilePath(), nullptr, selectPdf);
+                return;
+            }
+            RenderedBitmap* bmp = imgEngine->GetImageForPageElement(pageEl);
+            if (!bmp) {
+                return;
+            }
+            TempStr dir = path::GetDirTemp(filePath);
+            TempStr base = path::GetBaseNameTemp(filePath);
+            TempStr noExt = path::GetPathNoExtTemp(base);
+            Str origData = imgEngine->GetImageDataForPageElement(pageEl);
+            Str ext = ImageSaveExtFromData(origData);
+            if (len(ext) == 0) {
+                ext = StrL(".png");
+            }
+            TempStr destPath = path::JoinTemp(dir, fmt("%s_page_%d%s", noExt, pageNoUnderCursor, ext));
+            ShowImageEditWindow(win->hwndFrame, m, destPath, bmp, selectPdf, origData);
+            str::Free(origData);
+            delete bmp;
+            return;
+        };
+
         case CmdCopyLinkTarget: {
-            const WCHAR* tmp = SkipFileProtocol(value);
-            CopyTextToClipboard(tmp);
-        } break;
-        case CmdCopyComment:
-            CopyTextToClipboard(value);
-            break;
+            if (len(value) > 0) {
+                TempStr tmp = CleanupURLForClipbardCopyTemp(value);
+                CopyTextToClipboard(tmp);
+            }
+            return;
+        };
+        case CmdShowAnnotationText: {
+            Annotation* annot = ctx->annotationUnderCursor;
+            if (annot) {
+                ShowAnnotationTextPopup(win, annot);
+            }
+            return;
+        }
 
-        case CmdCopyImage:
+        case CmdCopyComment: {
+            Str comment = value;
+            if (ctx->annotationUnderCursor) {
+                // The page element's value is hover text. For FreeText that is
+                // only the author because the contents are already on the page.
+                comment = Contents(ctx->annotationUnderCursor);
+            }
+            if (!str::IsEmptyOrWhiteSpace(comment)) {
+                CopyTextToClipboard(comment);
+            }
+            return;
+        }
+
+        case CmdSaveAttachment: {
+            if (!pageEl || !pageEl->Is(kindPageElementDest)) {
+                return;
+            }
+            IPageDestination* elDest = pageEl->AsLink();
+            PageDestination* pd = (PageDestination*)elDest;
+            if (!pd) {
+                return;
+            }
+            // attachments are arbitrary binary
+            Str data = EngineMupdfLoadEmbedded(engine, pd);
+            if (len(data) == 0) {
+                return;
+            }
+            Str fileName = pd->GetValue();
+            TempStr dir = path::GetDirTemp(filePath);
+            fileName = path::GetBaseNameTemp(fileName);
+            TempStr dstPath = path::JoinTemp(dir, fileName);
+            SaveDataToFile(win->hwndFrame, dstPath, data);
+            str::Free(data);
+            return;
+        }
+
+        case CmdCopyImage: {
             if (pageEl) {
                 RenderedBitmap* bmp = dm->GetEngine()->GetImageForPageElement(pageEl);
                 if (bmp) {
-                    CopyImageToClipboard(bmp->GetBitmap(), false);
+                    // via the Pixmap, so an image with an alpha channel reaches
+                    // the clipboard with its transparency intact (#5844, #5598)
+                    Pixmap* px = PixmapFromRenderedBitmap(bmp); // takes ownership of bmp
+                    CopyPixmapToClipboard(px, false);
+                    FreePixmap(px);
                 }
-                delete bmp;
             }
-            break;
-        case CmdFavoriteAdd:
-            AddFavoriteForCurrentPage(win);
-            break;
-        case CmdFavoriteDel:
-            DelFavorite(filePath, pageNo);
-            break;
-        case CmdExitFullScreen:
-            ExitFullScreen(win);
-            break;
-        case CmdCreateAnnotText:
-        case CmdCreateAnnotFreeText:
-        case CmdCreateAnnotStamp:
-        case CmdCreateAnnotCaret:
-        case CmdCreateAnnotSquare:
-        case CmdCreateAnnotLine:
-        case CmdCreateAnnotCircle: {
-            Annotation* annot = EnginePdfCreateAnnotation(engine, annotType, pageNo, ptOnPage);
-            WindowInfoRerender(win);
-            StartEditAnnotations(win->currentTab, annot);
-        } break;
-        case CmdCreateAnnotHighlight:
-            MakeAnnotationFromSelection(win->currentTab, AnnotationType::Highlight);
-            break;
-        case CmdCreateAnnotSquiggly:
-            MakeAnnotationFromSelection(win->currentTab, AnnotationType::Squiggly);
-            break;
-        case CmdCreateAnnotStrikeOut:
-            MakeAnnotationFromSelection(win->currentTab, AnnotationType::StrikeOut);
-            break;
-        case CmdCreateAnnotUnderline:
-            MakeAnnotationFromSelection(win->currentTab, AnnotationType::Underline);
-            break;
-        case CmdCreateAnnotInk:
-        case CmdCreateAnnotPolyLine:
-            // TODO: implement me
-            break;
-    }
-    /*
-        { _TR_TODON("Line"), CmdCreateAnnotLine, 0 },
-        { _TR_TODON("Highlight"), CmdCreateAnnotHighlight, 0 },
-        { _TR_TODON("Underline"), CmdCreateAnnotUnderline, 0 },
-        { _TR_TODON("Strike Out"), CmdCreateAnnotStrikeOut, 0 },
-        { _TR_TODON("Squiggly"), CmdCreateAnnotSquiggly, 0 },
-        { _TR_TODON("File Attachment"), CmdCreateAnnotFileAttachment, 0 },
-        { _TR_TODON("Redact"), CmdCreateAnnotRedact, 0 },
-    */
-    // TODO: those require creating
-    /*
-        { _TR_TODON("Polygon"), CmdCreateAnnotPolygon, 0 },
-        { _TR_TODON("Poly Line"), CmdCreateAnnotPolyLine, 0 },
-    */
-
-    delete pageEl;
-}
-
-/* Zoom document in window 'hwnd' to zoom level 'zoom'.
-   'zoom' is given as a floating-point number, 1.0 is 100%, 2.0 is 200% etc.
-*/
-void OnMenuZoom(WindowInfo* win, int menuId) {
-    if (!win->IsDocLoaded()) {
-        return;
-    }
-
-    float zoom = ZoomMenuItemToZoom(menuId);
-    ZoomToSelection(win, zoom);
-}
-
-void OnMenuCustomZoom(WindowInfo* win) {
-    if (!win->IsDocLoaded() || win->AsEbook()) {
-        return;
-    }
-
-    float zoom = win->ctrl->GetZoomVirtual();
-    if (!Dialog_CustomZoom(win->hwndFrame, win->AsChm(), &zoom)) {
-        return;
-    }
-    ZoomToSelection(win, zoom);
-}
-
-static void RebuildFileMenu(TabInfo* tab, HMENU menu) {
-    int filter = 0;
-    if (tab && tab->AsChm()) {
-        filter |= MF_NOT_FOR_CHM;
-    }
-    if (tab && tab->AsEbook()) {
-        filter |= MF_NOT_FOR_EBOOK_UI;
-    }
-    if (!tab || tab->GetEngineType() != kindEngineComicBooks) {
-        filter |= MF_CBX_ONLY;
-    }
-
-    win::menu::Empty(menu);
-    HMENU m = BuildMenuFromMenuDef(menuDefFile, menu, filter);
-    if (gIsRaMicroBuild) {
-        win::menu::Remove(m, CmdOpenFolder);
-    }
-    AppendRecentFilesToMenu(menu);
-    AppendExternalViewersToMenu(menu, tab ? tab->filePath.Get() : nullptr);
-
-    // Suppress menu items that depend on specific software being installed:
-    // e-mail client, Adobe Reader, Foxit, PDF-XChange
-    // Don't hide items here that won't always be hidden
-    // (MenuUpdateStateForWindow() is for that)
-    if (!CanSendAsEmailAttachment()) {
-        win::menu::Remove(menu, CmdSendByEmail);
-    }
-
-    for (int cmd = CmdOpenWithFirst + 1; cmd < CmdOpenWithLast; cmd++) {
-        if (!CanViewWithKnownExternalViewer(tab, cmd)) {
-            win::menu::Remove(menu, cmd);
+            return;
+        }
+        case CmdFavoriteAdd: {
+            if (pageNoUnderCursor > 0) {
+                AddFavoriteForPage(win, pageNoUnderCursor);
+            }
+            return;
+        }
+        case CmdFavoriteDel: {
+            DelFavorite(filePath, pageNoUnderCursor, win->ctrl);
+            return;
         }
     }
-
-    DisplayModel* dm = tab ? tab->AsFixed() : nullptr;
-    EngineBase* engine = tab ? tab->GetEngine() : nullptr;
-    bool enableSaveAnnotations = false;
-    bool canDoAnnotations = gIsDebugBuild || gIsPreReleaseBuild || gIsDailyBuild;
-    if (canDoAnnotations) {
-        enableSaveAnnotations = EngineHasUnsavedAnnotations(engine);
-    }
-    win::menu::SetEnabled(menu, CmdSaveAnnotations, enableSaveAnnotations);
+    // everything else we forward to FrameOnCommand() in SumatraPDF.cpp
+    HwndSendCommand(win->hwndFrame, cmdId);
 }
 
-// so that we can do free everything at exit
-Vec<MenuOwnerDrawInfo*> g_menuDrawInfos;
+HMENU BuildMenu(MainWindow* win) {
+    WindowTab* tab = win->CurrentTab();
 
-void FreeAllMenuDrawInfos() {
-    while (g_menuDrawInfos.size() != 0) {
-        // Note: could be faster
-        FreeMenuOwnerDrawInfo(g_menuDrawInfos[0]);
-    }
-}
-
-void FreeMenuOwnerDrawInfo(MenuOwnerDrawInfo* modi) {
-    g_menuDrawInfos.Remove(modi);
-    str::Free(modi->text);
-    free(modi);
-}
-
-static HFONT gMenuFont = nullptr;
-
-HFONT GetMenuFont() {
-    if (!gMenuFont) {
-        NONCLIENTMETRICS ncm = {0};
-        ncm.cbSize = sizeof(ncm);
-        SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-        gMenuFont = CreateFontIndirect(&ncm.lfMenuFont);
-    }
-    return gMenuFont;
-}
-
-struct MenuText {
-    WCHAR* menuText;
-    int menuTextLen;
-    WCHAR* shortcutText;
-    int shortcutTextLen;
-};
-
-// menu text consists of potentially 2 parts:
-// - text of the menu item
-// - text for the keyboard shortcut
-// They are separated with \t
-static void ParseMenuText(WCHAR* s, MenuText& mt) {
-    mt.shortcutText = nullptr;
-    mt.menuText = s;
-    while (*s && *s != L'\t') {
-        s++;
-    }
-    mt.menuTextLen = (int)(s - mt.menuText);
-    if (*s != L'\t') {
-        return;
-    }
-    s++;
-    mt.shortcutText = s;
-    while (*s) {
-        s++;
-    }
-    mt.shortcutTextLen = (int)(s - mt.shortcutText);
-}
-
-void FreeMenuOwnerDrawInfoData(HMENU hmenu) {
-    MENUITEMINFOW mii = {0};
-    mii.cbSize = sizeof(MENUITEMINFOW);
-
-    int n = GetMenuItemCount(hmenu);
-    for (int i = 0; i < n; i++) {
-        mii.fMask = MIIM_DATA | MIIM_FTYPE | MIIM_SUBMENU;
-        BOOL ok = GetMenuItemInfoW(hmenu, (uint)i, TRUE /* by position */, &mii);
-        CrashIf(!ok);
-        auto modi = (MenuOwnerDrawInfo*)mii.dwItemData;
-        if (modi != nullptr) {
-            FreeMenuOwnerDrawInfo(modi);
-            mii.dwItemData = 0;
-            mii.fType &= ~MFT_OWNERDRAW;
-            SetMenuItemInfoW(hmenu, (uint)i, TRUE /* by position */, &mii);
-        }
-        if (mii.hSubMenu != nullptr) {
-            MarkMenuOwnerDraw(mii.hSubMenu);
-        }
-    };
-}
-void MarkMenuOwnerDraw(HMENU hmenu) {
-    if (!gOwnerDrawMenu) {
-        return;
-    }
-    WCHAR buf[1024];
-
-    MENUITEMINFOW mii = {0};
-    mii.cbSize = sizeof(MENUITEMINFOW);
-
-    int n = GetMenuItemCount(hmenu);
-
-    for (int i = 0; i < n; i++) {
-        buf[0] = 0;
-        mii.fMask = MIIM_BITMAP | MIIM_CHECKMARKS | MIIM_DATA | MIIM_FTYPE | MIIM_STATE | MIIM_SUBMENU | MIIM_STRING;
-        mii.dwTypeData = &(buf[0]);
-        mii.cch = dimof(buf);
-        BOOL ok = GetMenuItemInfoW(hmenu, (uint)i, TRUE /* by position */, &mii);
-        CrashIf(!ok);
-
-        mii.fMask = MIIM_FTYPE | MIIM_DATA;
-        mii.fType |= MFT_OWNERDRAW;
-        if (mii.dwItemData != 0) {
-            auto modi = (MenuOwnerDrawInfo*)mii.dwItemData;
-            FreeMenuOwnerDrawInfo(modi);
-        }
-        auto modi = AllocStruct<MenuOwnerDrawInfo>();
-        g_menuDrawInfos.Append(modi);
-        modi->fState = mii.fState;
-        modi->fType = mii.fType;
-        modi->hbmpItem = mii.hbmpItem;
-        modi->hbmpChecked = mii.hbmpChecked;
-        modi->hbmpUnchecked = mii.hbmpUnchecked;
-        if (str::Len(buf) > 0) {
-            modi->text = str::Dup(buf);
-        }
-        mii.dwItemData = (ULONG_PTR)modi;
-        SetMenuItemInfoW(hmenu, (uint)i, TRUE /* by position */, &mii);
-
-        if (mii.hSubMenu != nullptr) {
-            MarkMenuOwnerDraw(mii.hSubMenu);
-        }
-    }
-}
-
-enum {
-    kMenuPaddingY = 2,
-    kMenuPaddingX = 2,
-};
-
-void MenuOwnerDrawnMesureItem(HWND hwnd, MEASUREITEMSTRUCT* mis) {
-    if (ODT_MENU != mis->CtlType) {
-        return;
-    }
-    auto modi = (MenuOwnerDrawInfo*)mis->itemData;
-
-    bool isSeparator = bit::IsMaskSet(modi->fType, (uint)MFT_SEPARATOR);
-    if (isSeparator) {
-        mis->itemHeight = DpiScale(hwnd, 7);
-        mis->itemWidth = DpiScale(hwnd, 33);
-        return;
-    }
-
-    auto text = modi && modi->text ? modi->text : L"Dummy";
-    HFONT font = GetMenuFont();
-    MenuText mt;
-    ParseMenuText((WCHAR*)text, mt);
-
-    auto size = TextSizeInHwnd(hwnd, mt.menuText, font);
-    mis->itemHeight = size.dy;
-    int dx = size.dx;
-    if (mt.shortcutText != nullptr) {
-        // add space betweeen menu text and shortcut
-        size = TextSizeInHwnd(hwnd, L"    ", font);
-        dx += size.dx;
-        size = TextSizeInHwnd(hwnd, mt.shortcutText, font);
-        dx += size.dx;
-    }
-    auto padX = DpiScale(hwnd, kMenuPaddingX);
-    auto padY = DpiScale(hwnd, kMenuPaddingY);
-
-    auto cxMenuCheck = GetSystemMetrics(SM_CXMENUCHECK);
-    mis->itemHeight += padY * 2;
-    mis->itemWidth = uint(dx + DpiScale(hwnd, cxMenuCheck) + (padX * 2));
-}
-
-// https://gist.github.com/kjk/1df108aa126b7d8e298a5092550a53b7
-void MenuOwnerDrawnDrawItem([[maybe_unused]] HWND hwnd, DRAWITEMSTRUCT* dis) {
-    if (ODT_MENU != dis->CtlType) {
-        return;
-    }
-    auto modi = (MenuOwnerDrawInfo*)dis->itemData;
-    if (!modi) {
-        return;
-    }
-
-    // https://msdn.microsoft.com/en-us/library/windows/desktop/ms647578(v=vs.85).aspx
-
-    // low-order word of the dwTypeData member is the bitmap handle
-    // HBITMAP bmp = (HBITMAP)LOWORD(modi->dwTypeData) ?
-    // bool isBitmap = bit::IsMaskSet(modi->fType, (uint)MFT_BITMAP);
-
-    // ???
-    // bool isMenuBarBreak = bit::IsMaskSet(modi->fType, (uint)MFT_MENUBARBREAK);
-
-    // ??
-    // bool isMenuBreak = bit::IsMaskSet(modi->fType, (uint)MFT_MENUBREAK);
-
-    // bool isRadioCheck = bit::IsMaskSet(modi->fType, (uint)MFT_RADIOCHECK);
-
-    bool isSeparator = bit::IsMaskSet(modi->fType, (uint)MFT_SEPARATOR);
-
-    // default should be drawn in bold
-    // bool isDefault = bit::IsMaskSet(modi->fState, (uint)MFS_DEFAULT);
-
-    // disabled should be drawn grayed out
-    // bool isDisabled = bit::IsMaskSet(modi->fState, (uint)MFS_DISABLED);
-
-    // don't know what that means
-    // bool isHilited = bit::IsMaskSet(modi->fState, (uint)MFS_HILITE);
-
-    // checked/unchecked state for check and radio menus?
-    // uses hbmpChecked, otherwise use hbmpUnchecked ?
-    // bool isChecked = bit::IsMaskSet(modi->fState, (uint)MFS_CHECKED);
-
-    auto hdc = dis->hDC;
-    HFONT font = GetMenuFont();
-    auto prevFont = SelectObject(hdc, font);
-
-    COLORREF bgCol = GetAppColor(AppColor::MainWindowBg);
-    COLORREF txtCol = GetAppColor(AppColor::MainWindowText);
-
-    bool isSelected = bit::IsMaskSet(dis->itemState, (uint)ODS_SELECTED);
-    if (isSelected) {
-        // TODO: probably better colors
-        std::swap(bgCol, txtCol);
-    }
-
-    RECT rc = dis->rcItem;
-
-    int padY = DpiScale(hwnd, kMenuPaddingY);
-    int padX = DpiScale(hwnd, kMenuPaddingX);
-    int dxCheckMark = DpiScale(hwnd, GetSystemMetrics(SM_CXMENUCHECK));
-
-    auto hbr = CreateSolidBrush(bgCol);
-    FillRect(hdc, &rc, hbr);
-    DeleteObject(hbr);
-
-    if (isSeparator) {
-        CrashIf(modi->text);
-        int sx = rc.left + dxCheckMark;
-        int y = rc.top + (RectDy(rc) / 2);
-        int ex = rc.right - padX;
-        auto pen = CreatePen(PS_SOLID, 1, txtCol);
-        auto prevPen = SelectObject(hdc, pen);
-        MoveToEx(hdc, sx, y, nullptr);
-        LineTo(hdc, ex, y);
-        SelectObject(hdc, prevPen);
-        DeleteObject(pen);
-        return;
-    }
-
-    // TODO: probably could be a bitmap etc.
-    if (!modi->text) {
-        return;
-    }
-
-    MenuText mt;
-    ParseMenuText((WCHAR*)modi->text, mt);
-
-    // TODO: improve how we paint the menu:
-    // - paint checkmark if this is checkbox menu
-    // - position text the right way (not just DT_CENTER)
-    //   taking into account LTR mode
-    // - paint shortcut (part after \t if exists) separately
-    // - paint disabled state better
-    // - paint icons for system menus
-    SetTextColor(hdc, txtCol);
-    SetBkColor(hdc, bgCol);
-
-    // DrawTextEx handles & => underscore drawing
-    rc.top += padY;
-    rc.left += dxCheckMark;
-    DrawTextExW(hdc, mt.menuText, mt.menuTextLen, &rc, DT_LEFT, nullptr);
-    if (mt.shortcutText != nullptr) {
-        rc = dis->rcItem;
-        rc.top += padY;
-        rc.right -= (padX + dxCheckMark / 2);
-        DrawTextExW(hdc, mt.shortcutText, mt.shortcutTextLen, &rc, DT_RIGHT, nullptr);
-    }
-    SelectObject(hdc, prevFont);
-}
-
-//[ ACCESSKEY_GROUP Main Menubar
-HMENU BuildMenu(WindowInfo* win) {
-    TabInfo* tab = win->currentTab;
-    HMENU mainMenu = CreateMenu();
-
-    int filter = 0;
-    if (win->AsChm()) {
-        filter |= MF_NOT_FOR_CHM;
-    } else if (win->AsEbook()) {
-        filter |= MF_NOT_FOR_EBOOK_UI;
-    }
-    if (!tab || tab->GetEngineType() != kindEngineComicBooks) {
-        filter |= MF_CBX_ONLY;
-    }
-
-    HMENU m = CreateMenu();
-    RebuildFileMenu(tab, m);
-    AppendMenu(mainMenu, MF_POPUP | MF_STRING, (UINT_PTR)m, _TR("&File"));
-    m = BuildMenuFromMenuDef(menuDefView, CreateMenu(), filter);
-    AppendMenu(mainMenu, MF_POPUP | MF_STRING, (UINT_PTR)m, _TR("&View"));
-    m = BuildMenuFromMenuDef(menuDefGoTo, CreateMenu(), filter);
-    AppendMenu(mainMenu, MF_POPUP | MF_STRING, (UINT_PTR)m, _TR("&Go To"));
-    if (!win->AsEbook()) {
-        m = BuildMenuFromMenuDef(menuDefZoom, CreateMenu(), filter);
-        AppendMenu(mainMenu, MF_POPUP | MF_STRING, (UINT_PTR)m, _TR("&Zoom"));
-    }
-
-    // TODO: implement Favorites for ebooks
-    if (HasPermission(Perm_SavePreferences) && !win->AsEbook()) {
-        // I think it makes sense to disable favorites in restricted mode
-        // because they wouldn't be persisted, anyway
-        m = BuildMenuFromMenuDef(menuDefFavorites, CreateMenu());
-        RebuildFavMenu(win, m);
-        AppendMenu(mainMenu, MF_POPUP | MF_STRING, (UINT_PTR)m, _TR("F&avorites"));
-    }
-
-    m = BuildMenuFromMenuDef(menuDefSettings, CreateMenu(), filter);
-    if (gIsRaMicroBuild) {
-        win::menu::Remove(m, CmdChangeLanguage);
-        win::menu::Remove(m, CmdAdvancedOptions);
-    }
-#if defined(ENABLE_THEME)
-    // Build the themes sub-menu of the settings menu
-    MenuDef menuDefTheme[THEME_COUNT + 1];
-    static_assert(IDM_CHANGE_THEME_LAST - IDM_CHANGE_THEME_FIRST + 1 >= THEME_COUNT,
-                  "Too many themes. Either remove some or update IDM_CHANGE_THEME_LAST");
-    for (int i = 0; i < THEME_COUNT; i++) {
-        menuDefTheme[i] = {GetThemeByIndex(i)->name, IDM_CHANGE_THEME_FIRST + i, 0};
-    }
-    HMENU m2 = BuildMenuFromMenuDef(menuDefTheme, CreateMenu(), filter);
-    AppendMenu(m, MF_POPUP | MF_STRING, (UINT_PTR)m2, _TR("&Theme"));
-#endif
-    AppendMenu(mainMenu, MF_POPUP | MF_STRING, (UINT_PTR)m, _TR("&Settings"));
-
-    m = BuildMenuFromMenuDef(menuDefHelp, CreateMenu(), filter);
-    AppendMenu(mainMenu, MF_POPUP | MF_STRING, (UINT_PTR)m, _TR("&Help"));
-#if 0
-    // see MenuBarAsPopupMenu in Caption.cpp
-    m = GetSystemMenu(win->hwndFrame, FALSE);
-    AppendMenu(mainMenu, MF_POPUP | MF_STRING, (UINT_PTR)m, _TR("&Window"));
-#endif
-
-    if (gShowDebugMenu) {
-        m = BuildMenuFromMenuDef(menuDefDebug, CreateMenu(), filter);
-        if (!gIsRaMicroBuild) {
-            win::menu::Remove(m, CmdAdvancedOptions);
-        }
-
-        if (!gIsDebugBuild) {
-            RemoveMenu(m, CmdDebugTestApp, MF_BYCOMMAND);
-        }
-
-        if (gAddCrashMeMenu) {
-            AppendMenu(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuA(m, MF_STRING, (UINT_PTR)CmdDebugCrashMe, "Crash me");
-        }
-
-        AppendMenu(mainMenu, MF_POPUP | MF_STRING, (UINT_PTR)m, L"Debug");
-    }
-
-    MarkMenuOwnerDraw(mainMenu);
+    auto* ctx = NewBuildMenuCtx(tab, Point{0, 0});
+    AutoDelete delCtx(ctx);
+    HMENU mainMenu = BuildMenuFromDef(menuDefMenubar, CreateMenu(), ctx);
+    // BuildMenuFromDef just set the global to this window's submenu
+    win->menuReadAloud = GetReadAloudAppSubmenu();
     return mainMenu;
 }
-//] ACCESSKEY_GROUP Main Menubar
 
-void UpdateAppMenu(WindowInfo* win, HMENU m) {
-    CrashIf(!win);
+void UpdateAppMenu(MainWindow* win, HMENU m) {
+    ReportIf(!win);
     if (!win) {
         return;
     }
-    int id = (int)GetMenuItemID(m, 0);
-    if (id == menuDefFile[0].id) {
-        RebuildFileMenu(win->currentTab, m);
-    } else if (id == menuDefFavorites[0].id) {
-        win::menu::Empty(m);
-        BuildMenuFromMenuDef(menuDefFavorites, m);
+    UINT_PTR id = (UINT_PTR)GetMenuItemID(m, 0);
+    if (id == menuDefFile[0].idOrSubmenu) {
+        RebuildFileMenu(win->CurrentTab(), m);
+    } else if (id == menuDefFavorites[0].idOrSubmenu) {
+        MenuEmpty(m);
+        // build with a real ctx (not nullptr): command-visibility now hides
+        // document-dependent commands when no document is loaded, and a null ctx
+        // looks like "no document" -- which dropped CmdFavoriteAdd/CmdFavoriteDel
+        // from the rebuilt menu, so RebuildFavMenu's MenuSetText then failed
+        auto* ctx = NewBuildMenuCtx(win->CurrentTab(), Point{0, 0});
+        AutoDelete delCtx(ctx);
+        BuildMenuFromDef(menuDefFavorites, m, ctx);
         RebuildFavMenu(win, m);
+    } else if (id == menuDefZoom[0].idOrSubmenu) {
+        BuildMenuZoom(m);
+    } else if (m && m == win->menuReadAloud) {
+        RebuildReadAloudMenu(win, m, false, false);
+    } else if (IsReadAloudContextSubmenu(m)) {
+        RebuildReadAloudMenu(win, m, true, win->contextMenuPtValid);
     }
     MenuUpdateStateForWindow(win);
-    MarkMenuOwnerDraw(win->menu);
 }
 
 // show/hide top-level menu bar. This doesn't persist across launches
 // so that accidental removal of the menu isn't catastrophic
-void ShowHideMenuBar(WindowInfo* win, bool showTemporarily) {
-    CrashIf(!win->menu);
-    if (win->presentation || win->isFullScreen) {
+void ToggleMenuBar(MainWindow* win, bool showTemporarily) {
+    ReportIf(!win->menu);
+
+    if (win->InPresentation()) {
         return;
     }
 
     HWND hwnd = win->hwndFrame;
 
     if (showTemporarily) {
+        if (win->tabsInTitlebar) {
+            // can't show regular menu with custom caption, so do nothing
+            return;
+        }
         SetMenu(hwnd, win->menu);
         return;
     }
 
-    bool hideMenu = !showTemporarily && GetMenu(hwnd) != nullptr;
+    if (win->IsFullScreen()) {
+        gSettings->fullscreen.showMenubar = !gSettings->fullscreen.showMenubar;
+        if (gSettings->fullscreen.showMenubar) {
+            // use rebar-based menu bar (WS_CAPTION is stripped in fullscreen, so SetMenu won't work)
+            CreateMenuBarRebar(win);
+        } else {
+            DestroyMenuBarRebar(win);
+        }
+        ScheduleUiUpdate(win);
+        ShowMenuBarRebar(win);
+        return;
+    }
+
+    if (win->tabsInTitlebar) {
+        // toggle rebar menu bar while keeping tabs in titlebar
+        bool isShowing = IsShowingMenuBarRebar(win);
+        if (isShowing) {
+            DestroyMenuBarRebar(win);
+            gSettings->showMenubar = false;
+            gSettings->showMenubarWithTabs = false;
+        } else {
+            CreateMenuBarRebar(win);
+            gSettings->showMenubar = true;
+            gSettings->showMenubarWithTabs = true;
+        }
+        // layout first so the rebar is positioned correctly, then show it
+        ScheduleUiUpdate(win);
+        ShowMenuBarRebar(win);
+        return;
+    }
+
+    bool hideMenu = GetMenu(hwnd) != nullptr;
     SetMenu(hwnd, hideMenu ? nullptr : win->menu);
-    win->isMenuHidden = hideMenu;
+    gSettings->showMenubar = !hideMenu;
+    gSettings->showMenubarWithTabs = !hideMenu;
+}
+
+// --- Menu bar as rebar control (used when tabs are in titlebar) ---
+
+static int MenuBarToolbarIdealDy() {
+    PlatformFont* font = GetAppMenuFont();
+    int dy = PlatformFontLineHeight(font) + DpiScale(4);
+    int minDy = DpiScale(kTabBarDy);
+    return std::max(dy, minDy);
+}
+
+int GetMenuBarRebarHeight(MainWindow* win) {
+    HWND hwnd = win ? win->hwndMenuReBar : nullptr;
+    if (!hwnd || !::IsWindow(hwnd)) {
+        return 0;
+    }
+    // RB_GETBARHEIGHT underreports by 1px without WS_BORDER
+    int dy = (int)SendMessageW(hwnd, RB_GETBARHEIGHT, 0, 0) + 1;
+    if (dy > 1) {
+        return dy;
+    }
+    int ideal = MenuBarToolbarIdealDy();
+    return ideal;
+}
+
+static LRESULT CALLBACK MenuBarReBarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass,
+                                            DWORD_PTR /*dwRefData*/) {
+    if (WM_ERASEBKGND == uMsg) {
+        // always paint background with theme color to avoid gray strips in light theme
+        HDC hdc = (HDC)wParam;
+        Color bgCol = ThemeControlBackgroundColor();
+        auto* bgBrush = CreateSolidBrush(bgCol);
+        HdcFillRect(hdc, HwndClientRect(hWnd), bgBrush);
+        DeleteObject(bgBrush);
+        return 1;
+    }
+    if (WM_NOTIFY == uMsg) {
+        auto* win = FindMainWindowByHwnd(hWnd);
+        NMHDR* hdr = (NMHDR*)lParam;
+        if (win && hdr->code == NM_CUSTOMDRAW && hdr->hwndFrom == win->hwndMenuToolbar) {
+            NMTBCUSTOMDRAW* custDraw = (NMTBCUSTOMDRAW*)hdr;
+            switch (custDraw->nmcd.dwDrawStage) {
+                case CDDS_PREPAINT:
+                    return CDRF_NOTIFYITEMDRAW;
+                case CDDS_ITEMPREPAINT: {
+                    auto col = ThemeWindowTextColor();
+                    UINT itemState = custDraw->nmcd.uItemState;
+                    if (itemState & CDIS_DISABLED) {
+                        col = ThemeWindowTextDisabledColor();
+                    }
+                    custDraw->clrText = col;
+                    return CDRF_DODEFAULT;
+                }
+            }
+        }
+    }
+    if (WM_NCDESTROY == uMsg) {
+        RemoveWindowSubclass(hWnd, MenuBarReBarWndProc, uIdSubclass);
+    }
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+static LRESULT CALLBACK MenuBarToolbarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass,
+                                              DWORD_PTR /*dwRefData*/) {
+    if (WM_ERASEBKGND == uMsg) {
+        // don't erase background here; toolbar paints its own background during WM_PAINT
+        // filling here causes visible flicker (erase then paint) during window resize
+        return 1;
+    }
+    if (WM_NCDESTROY == uMsg) {
+        RemoveWindowSubclass(hWnd, MenuBarToolbarWndProc, uIdSubclass);
+    }
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+constexpr int kMenuBarCmdFirst = 50000;
+constexpr int kMenuBarCmdLast = 50020;
+
+struct MenuBarPopupNav {
+    MainWindow* win = nullptr;
+    HMENU rootMenu = nullptr;
+    HMENU currentMenu = nullptr;
+    UINT currentFlags = 0;
+    int nextMenuIdx = -1;
+};
+
+static MenuBarPopupNav gMenuBarPopupNav;
+
+// track when a menu popup was last dismissed so a second click on the same
+// menu bar button closes the popup instead of immediately reopening it
+static int gMenuBarLastDismissedIdx = -1;
+static u64 gMenuBarLastDismissedTick = 0;
+
+static bool ShouldSwitchCustomMenuBarPopup(UINT vk) {
+    if (!gMenuBarPopupNav.win || !gMenuBarPopupNav.rootMenu) {
+        return false;
+    }
+    if (!gMenuBarPopupNav.currentMenu || gMenuBarPopupNav.currentMenu != gMenuBarPopupNav.rootMenu) {
+        return false;
+    }
+    if (bit::IsMaskSet(gMenuBarPopupNav.currentFlags, (UINT)MF_POPUP)) {
+        return false;
+    }
+
+    int menuCount = GetMenuItemCount(gMenuBarPopupNav.win->menu);
+    if (menuCount <= 1) {
+        return false;
+    }
+
+    int step = 0;
+    if (vk == VK_LEFT) {
+        step = -1;
+    } else if (vk == VK_RIGHT) {
+        step = 1;
+    }
+    if (step == 0) {
+        return false;
+    }
+
+    gMenuBarPopupNav.nextMenuIdx += step;
+    if (gMenuBarPopupNav.nextMenuIdx < 0) {
+        gMenuBarPopupNav.nextMenuIdx = menuCount - 1;
+    } else if (gMenuBarPopupNav.nextMenuIdx >= menuCount) {
+        gMenuBarPopupNav.nextMenuIdx = 0;
+    }
+    return true;
+}
+
+// check if mouse is over a different toolbar button and switch to it
+static bool ShouldSwitchMenuBarOnMouseMove() {
+    if (!gMenuBarPopupNav.win || !gMenuBarPopupNav.win->hwndMenuToolbar) {
+        return false;
+    }
+    HWND hwndTb = gMenuBarPopupNav.win->hwndMenuToolbar;
+
+    Point pt = HwndGetCursorPos(hwndTb);
+
+    // hit-test the toolbar
+    int btnCount = TbGetButtonCount(hwndTb);
+    for (int i = 0; i < btnCount; i++) {
+        Rect rc = TbGetItemRect(hwndTb, i);
+        if (rc.Contains(pt.x, pt.y)) {
+            TBBUTTON tb{};
+            SendMessageW(hwndTb, TB_GETBUTTON, i, (LPARAM)&tb);
+            int menuIdx = tb.idCommand - kMenuBarCmdFirst;
+            if (menuIdx != gMenuBarPopupNav.nextMenuIdx) {
+                gMenuBarPopupNav.nextMenuIdx = menuIdx;
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+static LRESULT CALLBACK MenuBarMsgFilterHook(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == MSGF_MENU && gMenuBarPopupNav.win) {
+        MSG* msg = (MSG*)lParam;
+        if ((msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN) &&
+            ShouldSwitchCustomMenuBarPopup((UINT)msg->wParam)) {
+            EndMenu();
+            return 1;
+        }
+        if (msg->message == WM_MOUSEMOVE && ShouldSwitchMenuBarOnMouseMove()) {
+            EndMenu();
+            return 1;
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+void UpdateCustomMenuBarMenuSelect(MainWindow* win, WPARAM wp, LPARAM lp) {
+    if (gMenuBarPopupNav.win != win) {
+        return;
+    }
+
+    UINT flags = HIWORD(wp);
+    HMENU menu = (HMENU)lp;
+    if (flags == 0xFFFF && !menu) {
+        gMenuBarPopupNav.currentMenu = nullptr;
+        gMenuBarPopupNav.currentFlags = 0;
+        return;
+    }
+
+    gMenuBarPopupNav.currentMenu = menu;
+    gMenuBarPopupNav.currentFlags = flags;
+}
+
+void RebuildMenuBarButtons(MainWindow* win) {
+    HWND hwndMb = win->hwndMenuToolbar;
+    if (!hwndMb) {
+        return;
+    }
+
+    // remove existing buttons
+    while (SendMessageW(hwndMb, TB_DELETEBUTTON, 0, 0)) {
+    }
+
+    HMENU menu = win->menu;
+    int count = GetMenuItemCount(menu);
+    if (count <= 0) {
+        return;
+    }
+
+    MENUITEMINFOW mii{};
+    mii.cbSize = sizeof(MENUITEMINFOW);
+    mii.fMask = MIIM_SUBMENU | MIIM_STRING;
+
+    for (int i = 0; i < count && i < (kMenuBarCmdLast - kMenuBarCmdFirst); i++) {
+        mii.dwTypeData = nullptr;
+        mii.cch = 0;
+        GetMenuItemInfoW(menu, i, TRUE, &mii);
+        if (!mii.hSubMenu || !mii.cch) {
+            continue;
+        }
+        mii.cch++;
+        WCHAR* name = AllocArrayTemp<WCHAR>((int)mii.cch);
+        mii.dwTypeData = name;
+        GetMenuItemInfoW(menu, i, TRUE, &mii);
+
+        TBBUTTON b{};
+        b.iBitmap = I_IMAGENONE;
+        b.idCommand = kMenuBarCmdFirst + i;
+        b.fsState = TBSTATE_ENABLED;
+        b.fsStyle = BTNS_AUTOSIZE | BTNS_SHOWTEXT;
+        b.iString = (INT_PTR)name;
+        TbAddButtons(hwndMb, 1, &b);
+    }
+
+    TbAutoSize(hwndMb);
+
+    if (win->hwndMenuReBar) {
+        Rect rc = TbGetItemRect(hwndMb, 0);
+        int menuBarDy = MenuBarToolbarIdealDy();
+        if (rc.dy > 0) {
+            menuBarDy = rc.dy + (2 * rc.y);
+        }
+        REBARBANDINFOW rbBand{};
+        rbBand.cbSize = sizeof(REBARBANDINFOW);
+        rbBand.fMask = RBBIM_CHILDSIZE;
+        rbBand.cyChild = menuBarDy;
+        rbBand.cyMinChild = menuBarDy;
+        SendMessageW(win->hwndMenuReBar, RB_SETBANDINFO, 0, (LPARAM)&rbBand);
+    }
+}
+
+void CreateMenuBarRebar(MainWindow* win) {
+    if (!win || win->hwndMenuReBar) {
+        return;
+    }
+    // embedded hosts (TC lister) must not get titlebar menu rebar chrome
+    if (gMyWindowWasEmbedded) {
+        return;
+    }
+    HWND hwndParent = win->hwndFrame;
+    if (!hwndParent || !::IsWindow(hwndParent)) {
+        return;
+    }
+
+    bool isRtl = IsUIRtl();
+    HINSTANCE hinst = GetModuleHandle(nullptr);
+
+    // create hidden; caller shows after the scheduled relayout positions it
+    // no WS_BORDER (avoids 1px gap) and no RBS_BANDBORDERS (avoids gray band separators)
+    DWORD style = WS_CHILD | WS_CLIPCHILDREN | RBS_VARHEIGHT;
+    style |= CCS_NODIVIDER | CCS_NOPARENTALIGN;
+    DWORD exStyle = WS_EX_TOOLWINDOW;
+    if (isRtl) {
+        exStyle |= WS_EX_LAYOUTRTL;
+    }
+
+    win->hwndMenuReBar = CreateWindowExW(exStyle, REBARCLASSNAME, nullptr, style, 0, 0, 0, 0, hwndParent,
+                                         (HMENU)IDC_MENUBAR_REBAR, hinst, nullptr);
+    SetWindowSubclass(win->hwndMenuReBar, MenuBarReBarWndProc, 0, 0);
+
+    REBARINFO rbi{};
+    rbi.cbSize = sizeof(REBARINFO);
+    SendMessageW(win->hwndMenuReBar, RB_SETBARINFO, 0, (LPARAM)&rbi);
+    SendMessageW(win->hwndMenuReBar, RB_SETBKCOLOR, 0, ThemeControlBackgroundColor());
+
+    style = WS_CHILD | WS_CLIPSIBLINGS | TBSTYLE_FLAT | TBSTYLE_LIST;
+    style |= CCS_NODIVIDER | CCS_NOPARENTALIGN;
+    exStyle = 0;
+    if (isRtl) {
+        exStyle |= WS_EX_LAYOUTRTL;
+    }
+
+    win->hwndMenuToolbar = CreateWindowExW(exStyle, TOOLBARCLASSNAME, nullptr, style, 0, 0, 0, 0, win->hwndMenuReBar,
+                                           (HMENU)IDC_MENUBAR, hinst, nullptr);
+    SetWindowSubclass(win->hwndMenuToolbar, MenuBarToolbarWndProc, 0, 0);
+    TbSetButtonStructSize(win->hwndMenuToolbar, sizeofi(TBBUTTON));
+
+    if (!DarkModeIsActive()) {
+        if (!IsCurrentThemeDefault()) {
+            SetWindowTheme(win->hwndMenuToolbar, L"", L"");
+        }
+    }
+
+    PlatformFont* font = GetAppMenuFont();
+    HwndSetFont(win->hwndMenuToolbar, font->GetHFont());
+
+    DWORD tbExStyle = TbGetExtendedStyle(win->hwndMenuToolbar);
+    tbExStyle |= TBSTYLE_EX_MIXEDBUTTONS;
+    TbSetExtendedStyle(win->hwndMenuToolbar, tbExStyle);
+
+    RebuildMenuBarButtons(win);
+
+    Rect rc = TbGetItemRect(win->hwndMenuToolbar, 0);
+    int menuBarDy = rc.dy + (2 * rc.y);
+    if (menuBarDy <= 0) {
+        menuBarDy = MenuBarToolbarIdealDy();
+    }
+
+    ShowWindow(win->hwndMenuToolbar, SW_SHOW);
+
+    REBARBANDINFOW rbBand{};
+    rbBand.cbSize = sizeof(REBARBANDINFOW);
+    rbBand.fMask = RBBIM_STYLE | RBBIM_CHILD | RBBIM_CHILDSIZE;
+    rbBand.fStyle = RBBS_FIXEDSIZE;
+    rbBand.hwndChild = win->hwndMenuToolbar;
+    rbBand.cxMinChild = 0;
+    rbBand.cyMinChild = menuBarDy;
+    rbBand.cx = 0;
+    SendMessageW(win->hwndMenuReBar, RB_INSERTBAND, (WPARAM)-1, (LPARAM)&rbBand);
+
+    DarkModeApplyToMenuBar(win->hwndMenuReBar);
+}
+
+void ShowMenuBarRebar(MainWindow* win) {
+    HWND hwnd = win ? win->hwndMenuReBar : nullptr;
+    if (hwnd && ::IsWindow(hwnd)) {
+        ShowWindow(hwnd, SW_SHOW);
+    }
+}
+
+void DestroyMenuBarRebar(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    // clear fields first so re-entrant layout/paint cannot SetWindowPos them
+    HWND hwndTb = win->hwndMenuToolbar;
+    HWND hwndRb = win->hwndMenuReBar;
+    win->hwndMenuToolbar = nullptr;
+    win->hwndMenuReBar = nullptr;
+    // hide before destroy so nested paint is less likely to walk half-torn
+    // rebar/toolbar scroll-arrow state (comctl32!DrawScrollBar AV)
+    if (hwndRb && ::IsWindow(hwndRb)) {
+        ShowWindow(hwndRb, SW_HIDE);
+    }
+    if (hwndTb && ::IsWindow(hwndTb)) {
+        ShowWindow(hwndTb, SW_HIDE);
+        DestroyWindow(hwndTb);
+    }
+    if (hwndRb && ::IsWindow(hwndRb)) {
+        DestroyWindow(hwndRb);
+    }
+}
+
+bool IsShowingMenuBarRebar(MainWindow* win) {
+    if (!win) {
+        return false;
+    }
+    HWND hwnd = win->hwndMenuReBar;
+    if (!hwnd || !::IsWindow(hwnd)) {
+        return false;
+    }
+    // host reparented us as WS_CHILD: menu rebar is being (or about to be)
+    // torn down; treat as not showing so layout does not SetWindowPos it
+    if (gMyWindowWasEmbedded) {
+        return false;
+    }
+    if (win->InPresentation() || win->isQuickLook) {
+        return false;
+    }
+    return true;
+}
+
+bool HandleMenuBarCommand(MainWindow* win, int cmdId) {
+    if (cmdId < kMenuBarCmdFirst || cmdId >= kMenuBarCmdLast) {
+        return false;
+    }
+    if (!win->hwndMenuToolbar) {
+        return false;
+    }
+
+    int menuCount = GetMenuItemCount(win->menu);
+    int menuIdx = cmdId - kMenuBarCmdFirst;
+
+    // if same button was clicked shortly after dismissing its popup, treat as toggle-close
+    u64 now = GetTickCount64();
+    if (menuIdx == gMenuBarLastDismissedIdx && (now - gMenuBarLastDismissedTick) < 500) {
+        gMenuBarLastDismissedIdx = -1;
+        return true;
+    }
+
+    UINT flags = TPM_LEFTALIGN | TPM_TOPALIGN;
+    if (IsUIRtl()) {
+        flags = TPM_RIGHTALIGN | TPM_TOPALIGN;
+    }
+
+    for (;;) {
+        HMENU subMenu = GetSubMenu(win->menu, menuIdx);
+        if (!subMenu) {
+            return true;
+        }
+
+        // get button rect in screen coordinates
+        int btnCmdId = kMenuBarCmdFirst + menuIdx;
+        int btnIdx = (int)SendMessageW(win->hwndMenuToolbar, TB_COMMANDTOINDEX, btnCmdId, 0);
+        Rect btnRect = TbGetItemRect(win->hwndMenuToolbar, btnIdx);
+        btnRect = HwndMapRectToWindow(btnRect, win->hwndMenuToolbar, HWND_DESKTOP);
+
+        gMenuBarPopupNav.win = win;
+        gMenuBarPopupNav.rootMenu = subMenu;
+        gMenuBarPopupNav.currentMenu = subMenu;
+        gMenuBarPopupNav.currentFlags = 0;
+        gMenuBarPopupNav.nextMenuIdx = menuIdx;
+
+        HHOOK hook = SetWindowsHookExW(WH_MSGFILTER, MenuBarMsgFilterHook, nullptr, GetCurrentThreadId());
+        TrackPopupMenu(subMenu, flags, btnRect.x, btnRect.y + btnRect.dy, 0, win->hwndFrame, nullptr);
+        if (hook) {
+            UnhookWindowsHookEx(hook);
+        }
+
+        int nextMenuIdx = gMenuBarPopupNav.nextMenuIdx;
+        gMenuBarPopupNav = {};
+        if (nextMenuIdx == menuIdx || menuCount <= 1) {
+            gMenuBarLastDismissedIdx = menuIdx;
+            gMenuBarLastDismissedTick = GetTickCount64();
+            break;
+        }
+        menuIdx = nextMenuIdx;
+    }
+
+    return true;
+}
+
+// Activate a menu bar button by accelerator key (Alt+letter).
+// If accel is 0, activate the first menu item.
+// Returns true if handled.
+bool ActivateMenuBarByAccel(MainWindow* win, WCHAR accel) {
+    if (!win->hwndMenuToolbar || !win->menu) {
+        return false;
+    }
+
+    int count = GetMenuItemCount(win->menu);
+    if (count <= 0) {
+        return false;
+    }
+
+    // if accel is 0 (bare Alt press), open the first menu
+    if (accel == 0) {
+        return HandleMenuBarCommand(win, kMenuBarCmdFirst);
+    }
+
+    // normalize to uppercase for matching
+    if (accel >= 'a' && accel <= 'z') {
+        accel -= 'a' - 'A';
+    }
+
+    // find the menu item whose text has &<accel>
+    MENUITEMINFOW mii{};
+    mii.cbSize = sizeof(MENUITEMINFOW);
+    mii.fMask = MIIM_STRING;
+
+    for (int i = 0; i < count && i < (kMenuBarCmdLast - kMenuBarCmdFirst); i++) {
+        mii.dwTypeData = nullptr;
+        mii.cch = 0;
+        GetMenuItemInfoW(win->menu, i, TRUE, &mii);
+        if (!mii.cch) {
+            continue;
+        }
+        mii.cch++;
+        WCHAR* name = AllocArrayTemp<WCHAR>((int)mii.cch);
+        mii.dwTypeData = name;
+        GetMenuItemInfoW(win->menu, i, TRUE, &mii);
+
+        // look for &X where X matches accel
+        WStr menuName(name, len(WStr(name)));
+        for (int off = 0; off < menuName.len; off++) {
+            if (menuName.s[off] == L'&' && off + 1 < menuName.len) {
+                WCHAR ch = menuName.s[off + 1];
+                if (ch >= 'a' && ch <= 'z') {
+                    ch -= 'a' - 'A';
+                }
+                if (ch == accel) {
+                    return HandleMenuBarCommand(win, kMenuBarCmdFirst + i);
+                }
+                break;
+            }
+        }
+    }
+
+    return false;
 }

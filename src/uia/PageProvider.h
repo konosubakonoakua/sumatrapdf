@@ -1,4 +1,4 @@
-/* Copyright 2021 the SumatraPDF project authors (see AUTHORS file).
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
 struct DisplayModel;
@@ -6,7 +6,7 @@ class SumatraUIAutomationDocumentProvider;
 class SumatraUIAutomationPageProvider : public IRawElementProviderFragment,
                                         public IRawElementProviderSimple,
                                         public IValueProvider {
-    LONG refCount;
+    AtomicInt refCount;
     int pageNum;
     HWND canvasHwnd;
     DisplayModel* dm;
@@ -28,7 +28,6 @@ class SumatraUIAutomationPageProvider : public IRawElementProviderFragment,
 
     int GetPageNum() const;
     SumatraUIAutomationPageProvider* GetNextPage();
-    SumatraUIAutomationPageProvider* GetPreviousPage();
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(const IID&, void**);

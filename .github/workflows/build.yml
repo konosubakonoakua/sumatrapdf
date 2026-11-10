@@ -3,33 +3,42 @@ on:
   push:
   pull_request:
   repository_dispatch:
-    types: [build-pre-rel, build-ramicro-pre-rel]
+    types: [build-pre-rel]
+permissions:
+  contents: read
 jobs:
   build:
     name: Build
-    runs-on: windows-latest
+    #runs-on: SumatraBuilder
+    runs-on: windows-2025-vs2026
     steps:
-      - name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: 1.16
-
       - name: Check out source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # needed to calc build number via git log --oneline
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Build
         env:
-          CERT_PWD: ${{ secrets.CERT_PWD }}
-        run: .\doit.bat -ci
+          R2_SECRET: ${{ secrets.R2_SECRET }}
+          R2_ACCESS: ${{ secrets.R2_ACCESS }}
+          BB_SECRET: ${{ secrets.BB_SECRET }}
+          BB_ACCESS: ${{ secrets.BB_ACCESS }}
+        run: bun .\cmd\build.ts -ci
 
-      # a separate step from -ci to make logs easier to read
-      - name: Upload to s3 etc.
-        env:
-          AWS_SECRET: ${{ secrets.AWS_SECRET }}
-          AWS_ACCESS: ${{ secrets.AWS_ACCESS }}
-          SPACES_KEY: ${{ secrets.SPACES_KEY }}
-          SPACES_SECRET: ${{ secrets.SPACES_SECRET }}
-        run: .\doit.bat -ci-upload
+  ng:
+    name: Windows ng x64 release
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Build ng
+        run: bun cmd/ng-build.ts -rel SumatraPDF
+      - name: Run ng unit tests
+        run: bun cmd/ng-build.ts -rel test_util -run -- -for-ai

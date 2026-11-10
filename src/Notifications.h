@@ -1,74 +1,125 @@
-/* Copyright 2021 the SumatraPDF project authors (see AUTHORS file).
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
 struct NotificationWnd;
+struct MainWindow;
+struct WindowTab;
+struct VirtCtrl;
+struct VirtRichText;
+struct ILayout;
+struct PlatformFont;
 
-typedef std::function<void(NotificationWnd*)> NotificationWndRemovedCallback;
+extern Kind kNotifZoomOrView;
+extern Kind kNotifCursorPos;
+extern Kind kNotifActionResponse;
+extern Kind kNotifPageInfo;
+extern Kind kNotifAdHoc;
+extern Kind kNotifLazyLayout;
+extern Kind kNotifChapterLayout;
 
-// this is a unique id for notification group that allows decoupling it
-// from the rest of the code.
-typedef const char* NotificationGroupId;
-
-enum NotificationOptions {
-    NOS_WITH_TIMEOUT = 0, // timeout after 3 seconds, no highlight
-    NOS_PERSIST = (1 << 0),
-    NOS_HIGHLIGHT = (1 << 1),
-    NOS_WARNING = NOS_PERSIST | NOS_HIGHLIGHT,
+enum class NotifCloseReason {
+    User,    // close button
+    Timeout, // timeoutMs elapsed
+    Program, // CloseNotification()
 };
 
-struct NotificationWnd : public ProgressUpdateUI {
-    HWND parent = nullptr;
-    HWND hwnd = nullptr;
-    int timeoutInMS = 0; // 0 means no timeout
-    bool hasProgress = false;
-    bool hasClose = false;
+struct NotificationClosedEvent {
+    NotificationWnd* wnd = nullptr;
+    NotifCloseReason reason = NotifCloseReason::Program;
+};
 
-    HFONT font = nullptr;
-    bool highlight = false;
-    NotificationWndRemovedCallback wndRemovedCb = nullptr;
+using NotificationClosed = Func1<NotificationClosedEvent*>;
 
-    // only used for progress notifications
-    bool isCanceled = false;
-    int progress = 0;
-    int progressWidth = 0;
-    WCHAR* progressMsg = nullptr; // must contain two %d (for current and total)
+constexpr const int kNotifDefaultTimeOut = 1000 * 3; // 3 seconds
+constexpr const int kNotif5SecsTimeOut = 1000 * 5;
+constexpr const int kNotifNoTimeout = 0;
 
-    bool Create(const WCHAR* msg, const WCHAR* progressMsg);
+// where on the canvas the notification is anchored. The corner variants stack
+// multiple notifications toward the opposite edge. BottomBar is different: it
+// spans the full canvas width along the bottom with centered text, for a status
+// hint (e.g. the F7 keyboard-selection help).
+// fixed underlying type so it can be forward-declared (e.g. in SumatraPDF.h)
+enum class NotifCorner : int {
+    TopLeft, // default; how notifications were always positioned
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    BottomBar,
+    Count, // number of positions; used to size per-position stacking state
+};
 
-    NotificationGroupId groupId = nullptr; // for use by Notifications
+// default distance (in unscaled px) from the canvas edges
+constexpr const int kNotifDefaultMargin = 8;
 
-    // to reduce flicker, we might ask the window to shrink the size less often
-    // (notifcation windows are only shrunken if by less than factor shrinkLimit)
+struct NotificationCreateArgs {
+    HWND hwndParent = nullptr;
+    // as in ng: used when hwndParent isn't set, shows over win's canvas
+    MainWindow* win = nullptr;
+    PlatformFont* font = nullptr;
+    Kind groupId = kNotifActionResponse;
+    bool warning = false;
+    bool noClose = false; // if true, no close button; must have timeoutMs > 0
+    int timeoutMs = 0;    // if 0 => persists until closed manually
+    int delayInMs = 0;    // if > 0 => create hidden, show after delay
     float shrinkLimit = 1.0f;
-
-    // Note: in most cases use WindowInfo::ShowNotification()
-    explicit NotificationWnd(HWND parent, int timeoutInMS);
-
-    virtual ~NotificationWnd();
-
-    void UpdateMessage(const WCHAR* message, int timeoutInMS = 0, bool highlight = false);
-
-    // ProgressUpdateUI methods
-    void UpdateProgress(int current, int total) override;
-    bool WasCanceled() override;
+    NotifCorner corner = NotifCorner::TopLeft;
+    int xMargin = kNotifDefaultMargin; // distance from the left/right edge
+    int yMargin = kNotifDefaultMargin; // distance from the top/bottom edge
+    Str msg;
+    // if true, `msg` is shown verbatim: the tip markup ([text](CmdFoo),
+    // **bold**, (Key/..), (Kbd/..)) is not parsed. Required for any message
+    // that embeds text from outside the app (file paths, document metadata,
+    // server responses) - see GHSA-2wv2-qm2f-vmxh
+    bool plainText = false;
+    // when set, the message is this pre-built rich text instead of `msg` parsed
+    // as tip markup, for messages mixing app-authored markup with outside text.
+    // `msg` is still the window text. ownership passes to the notification
+    VirtRichText* richMsg = nullptr;
+    // when set, the notification shows this VirtCtrl tree instead of `msg`.
+    // ownership passes to the notification
+    ILayout* content = nullptr;
+    // if set, the notification is only shown while this tab is the active tab
+    // (hidden when switching to another tab in the same window)
+    WindowTab* tab = nullptr;
+    // called on close (button, timeout, CloseNotification()) instead of the
+    // default removal; must call RemoveNotification(ev->wnd)
+    NotificationClosed onClosed;
 };
 
-struct Notifications {
-    Vec<NotificationWnd*> wnds;
+void SetNotifWindow(NotificationCreateArgs&, MainWindow*);
+void NotificationUpdateMessage(NotificationWnd* wnd, Str msg, int timeoutInMS = 0, bool highlight = false);
+TempStr NotificationGetMessageTemp(NotificationWnd* wnd);
+void RemoveNotification(NotificationWnd*);
+void CloseNotification(NotificationWnd*, NotifCloseReason reason = NotifCloseReason::Program);
+void SetNotificationsEnabled(bool);
+bool RemoveNotificationsForGroup(HWND, Kind);
+void RemoveNotificationsForHwnd(HWND);
+NotificationWnd* GetNotificationForGroup(HWND, Kind);
+bool UpdateNotificationProgress(NotificationWnd*, Str msg, int perc);
+void RelayoutNotifications(HWND hwnd);
+void ShowNotificationsForActiveTab(HWND hwndCanvas, WindowTab* activeTab);
+void RemoveNotificationsForTab(WindowTab* tab);
 
-    void MoveBelow(NotificationWnd* fix, NotificationWnd* move);
-    void Remove(NotificationWnd* wnd);
+NotificationWnd* ShowNotification(const NotificationCreateArgs& args);
+NotificationWnd* ShowTemporaryNotification(HWND hwnd, Str msg, int timeoutMs = kNotifDefaultTimeOut);
+NotificationWnd* ShowCustomNotification(HWND hwndParent, ILayout* content, int timeoutMs = kNotifNoTimeout);
+NotificationWnd* ShowWarningNotification(HWND hwndParent, Str msg, int timeoutMs);
 
-    ~Notifications();
-    bool Contains(NotificationWnd* wnd) const;
+// same, for a message that isn't fully app-authored: shown verbatim, no markup
+NotificationWnd* ShowPlainNotification(HWND hwnd, Str msg, int timeoutMs = kNotifDefaultTimeOut);
+NotificationWnd* ShowPlainWarningNotification(HWND hwndParent, Str msg, int timeoutMs);
 
-    // groupId is used to classify notifications and causes a notification
-    // to replace any other notification of the same group
-    void Add(NotificationWnd*, NotificationGroupId);
-    NotificationWnd* GetForGroup(NotificationGroupId) const;
-    void RemoveForGroup(NotificationGroupId);
-    void Relayout();
+// as in ng: address the notifications of win's canvas
+bool RemoveNotificationsForGroup(MainWindow*, Kind);
+NotificationWnd* GetNotificationForGroup(MainWindow*, Kind);
+NotificationWnd* ShowTemporaryNotification(MainWindow* win, Str msg, int timeoutMs = kNotifDefaultTimeOut);
+NotificationWnd* ShowWarningNotification(MainWindow* win, Str msg, int timeoutMs);
+NotificationWnd* ShowPlainNotification(MainWindow* win, Str msg, int timeoutMs = kNotifDefaultTimeOut);
+NotificationWnd* ShowPlainWarningNotification(MainWindow* win, Str msg, int timeoutMs);
 
-    // NotificationWndCallback methods
-    void RemoveNotification(NotificationWnd* wnd);
-};
+void MaybeDelayedWarningNotification(Str msg);
+void ShowMaybeDelayedNotifications(HWND hwndParent);
+void InstallLayoutNotifHooks();
+void InstallFontDownloadNotifHook();
+
+int CalcPerc(int current, int total);

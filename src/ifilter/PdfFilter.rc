@@ -1,5 +1,5 @@
 #include <windows.h>
-#include "../Version.h"
+#include "../shared/Version.h"
 
 VS_VERSION_INFO    VERSIONINFO     MOVEABLE IMPURE LOADONCALL DISCARDABLE
   FILEVERSION    VER_RESOURCE
@@ -17,7 +17,7 @@ BEGIN
     BEGIN
       VALUE "FileDescription",  "SumatraPDF IFilter Search Helper"
       VALUE "FileVersion",      VER_RESOURCE_STR
-      VALUE "LegalCopyright",   COPYRIGHT_STR
+      VALUE "LegalCopyright",   kCopyrightStr
       VALUE "OriginalFilename", "PdfFilter.dll"
       VALUE "ProductName",      "SumatraPDF"
       VALUE "ProductVersion",   VER_RESOURCE_STR
